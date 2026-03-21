@@ -252,11 +252,14 @@ class ColBERT(SentenceTransformer):
         )
         hidden_size = self[0].get_word_embedding_dimension()
 
+        self._is_static = not isinstance(self[0], Transformer)
+
         # Add a linear projection layer to the model in order to project the embeddings to the desired size.
         if len(self) < 2:
             # If the model is a stanford-nlp ColBERT, load the weights of the dense layer
             if (
-                self[0].auto_model.config.architectures is not None
+                not self._is_static
+                and self[0].auto_model.config.architectures is not None
                 and self[0].auto_model.config.architectures[0] == "HF_ColBERT"
             ):
                 self.append(
@@ -380,9 +383,15 @@ class ColBERT(SentenceTransformer):
 
         # Try adding the prefixes to the tokenizer. We call resize_token_embeddings twice to ensure the tokens are added only if resize_token_embeddings works. There should be a better way to do this.
         try:
-            self._first_module().auto_model.resize_token_embeddings(len(self.tokenizer))
-            self.tokenizer.add_tokens([self.query_prefix, self.document_prefix])
-            self._first_module().auto_model.resize_token_embeddings(len(self.tokenizer))
+            if self._is_static:
+                first_module = self._first_module()
+                first_module.resize_token_embeddings(len(self.tokenizer))
+                self.tokenizer.add_tokens([self.query_prefix, self.document_prefix])
+                first_module.resize_token_embeddings(len(self.tokenizer))
+            else:
+                self._first_module().auto_model.resize_token_embeddings(len(self.tokenizer))
+                self.tokenizer.add_tokens([self.query_prefix, self.document_prefix])
+                self._first_module().auto_model.resize_token_embeddings(len(self.tokenizer))
         except NotImplementedError:
             logger.warning(
                 "The tokenizer does not support resizing the token embeddings, the prefixes token have not been added to vocabulary."
@@ -1325,11 +1334,12 @@ class ColBERT(SentenceTransformer):
             if "do_query_expansion" in self._model_config:
                 self.do_query_expansion = self._model_config["do_query_expansion"]
 
+        from .StaticEmbedding import StaticEmbedding
+
         return [
             module
             for module in modules.values()
-            if isinstance(module, Transformer)
-            or isinstance(module, DenseSentenceTransformer)
+            if isinstance(module, (Transformer, DenseSentenceTransformer, StaticEmbedding))
         ], module_kwargs
 
     def _get_model_type(
