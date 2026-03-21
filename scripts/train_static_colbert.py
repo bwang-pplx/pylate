@@ -95,16 +95,23 @@ def main():
         help="Tokenizer to use for the static embedding table",
     )
     parser.add_argument(
-        "--embedding_dim",
-        type=int,
-        default=128,
-        help="Dimension of the static token embeddings",
-    )
-    parser.add_argument(
         "--projection_dim",
         type=int,
         default=128,
         help="Output dimension of the Dense projection layer",
+    )
+    parser.add_argument(
+        "--random_init",
+        action="store_true",
+        help="Use random embeddings instead of pretrained weights. "
+        "When not set, loads the embedding table from the base model.",
+    )
+    parser.add_argument(
+        "--embedding_dim",
+        type=int,
+        default=None,
+        help="Dimension of the static token embeddings (only used with --random_init, "
+        "otherwise inferred from the pretrained model)",
     )
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument(
@@ -131,12 +138,30 @@ def main():
     train_dataset = load_train_datasets()
 
     # Build static ColBERT model
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    static_embedding = models.StaticEmbedding(
-        tokenizer, embedding_dim=args.embedding_dim
-    )
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+
+    if args.random_init:
+        embedding_dim = args.embedding_dim or 1024
+        print(f"Using random initialization with embedding_dim={embedding_dim}")
+        static_embedding = models.StaticEmbedding(
+            tokenizer, embedding_dim=embedding_dim
+        )
+    else:
+        # Load pretrained embedding weights from the base model
+        from transformers import AutoModel
+
+        print(f"Loading pretrained embedding weights from {args.tokenizer}...")
+        base_model = AutoModel.from_pretrained(args.tokenizer, trust_remote_code=True)
+        pretrained_weights = base_model.embed_tokens.weight.detach().clone()
+        embedding_dim = pretrained_weights.shape[1]
+        del base_model
+        print(f"Loaded embedding table: {pretrained_weights.shape[0]} tokens x {embedding_dim} dim")
+        static_embedding = models.StaticEmbedding(
+            tokenizer, embedding_weights=pretrained_weights
+        )
+
     model = models.ColBERT(
-        modules=[static_embedding, models.Dense(args.embedding_dim, args.projection_dim)],
+        modules=[static_embedding, models.Dense(embedding_dim, args.projection_dim)],
         device="cpu",
         query_length=args.query_length,
         document_length=args.document_length,
