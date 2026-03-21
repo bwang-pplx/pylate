@@ -197,7 +197,7 @@ def main():
         bf16=True,
         learning_rate=args.lr,
         warmup_ratio=args.warmup_ratio,
-        dataloader_num_workers=8,
+        dataloader_num_workers=0,
         dataloader_pin_memory=True,
         dataloader_drop_last=True,
         ddp_find_unused_parameters=False,
