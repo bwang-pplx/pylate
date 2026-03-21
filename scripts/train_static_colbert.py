@@ -172,9 +172,6 @@ def main():
     print(f"Total parameters: {total_params / 1e6:.1f}M")
     print(f"Trainable parameters: {trainable_params / 1e6:.1f}M")
 
-    # Compile for speed
-    model = torch.compile(model)
-
     # Loss
     train_loss = losses.Contrastive(
         model=model,
