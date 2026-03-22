@@ -339,7 +339,7 @@ def run_experiment(
                     "params_M": round(n_params, 1),
                     "batch_size": batch_size,
                 },
-                reinit=True,
+                finish_previous=True,
             )
             wandb_log = {
                 "num_layers": len(keep_indices),
