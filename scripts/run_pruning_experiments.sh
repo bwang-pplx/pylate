@@ -16,8 +16,9 @@ OUTPUT="results/layer_pruning_results.json"
 BATCH_SIZE=32
 SCRIPT="scripts/layer_pruning_experiment.py"
 
+WANDB_PROJECT="${WANDB_PROJECT:-colbert-layer-pruning}"
 PYTHON=".venv/bin/python"
-RUN="$PYTHON $SCRIPT --model $MODEL --output $OUTPUT --batch-size $BATCH_SIZE --device cuda"
+RUN="$PYTHON $SCRIPT --model $MODEL --output $OUTPUT --batch-size $BATCH_SIZE --device cuda --wandb-project $WANDB_PROJECT"
 
 MODE="${1:-all}"
 

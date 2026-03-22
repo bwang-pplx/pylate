@@ -28,6 +28,13 @@ from torch import nn
 
 from pylate import evaluation, models
 
+try:
+    import wandb
+
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
+
 
 def get_transformer_layers(model: models.ColBERT) -> nn.ModuleList:
     """Get the transformer layer list from the model backbone."""
@@ -219,7 +226,13 @@ def run_experiment(
     skip_baseline: bool = False,
     config_name: str | None = None,
     layer_indices: list[int] | None = None,
+    wandb_project: str | None = None,
 ):
+    # Initialize wandb
+    use_wandb = wandb_project is not None and HAS_WANDB
+    if wandb_project and not HAS_WANDB:
+        print("WARNING: wandb not installed, skipping wandb logging")
+
     # Load existing results for appending
     all_results = load_existing_results(output_path)
     if all_results:
@@ -310,6 +323,38 @@ def run_experiment(
         # Save after each config (incremental, crash-safe)
         save_results(output_path, all_results)
 
+        # Log to wandb — each config is its own run for sweep-style comparison
+        if use_wandb:
+            strategy = config_name_iter.rsplit("_", 1)[0] if config_name_iter != "full" else "full"
+            run = wandb.init(
+                project=wandb_project,
+                group=f"layer-pruning-{model_name.split('/')[-1]}",
+                name=config_name_iter,
+                config={
+                    "model": model_name,
+                    "strategy": strategy,
+                    "num_layers": len(keep_indices),
+                    "total_layers": num_layers,
+                    "layers_kept": keep_indices,
+                    "params_M": round(n_params, 1),
+                    "batch_size": batch_size,
+                },
+                reinit=True,
+            )
+            wandb_log = {
+                "num_layers": len(keep_indices),
+                "params_M": round(n_params, 1),
+                "time_s": round(elapsed, 1),
+                "mean_ndcg@10": ndcg10,
+                "mean_mrr@10": mrr10,
+                "mean_recall@10": recall10,
+            }
+            for k, v in metrics.items():
+                if isinstance(v, (int, float)):
+                    wandb_log[k] = v
+            wandb.log(wandb_log)
+            wandb.finish()
+
         print(f"  nDCG@10: {ndcg10:.4f} | MRR@10: {mrr10:.4f} | Recall@10: {recall10:.4f}")
         print(f"  Params: {n_params:.1f}M | Time: {elapsed:.1f}s")
 
@@ -368,6 +413,11 @@ def main():
         default=None,
         help="Explicit layer indices to keep (overrides --strategies)",
     )
+    parser.add_argument(
+        "--wandb-project",
+        default=None,
+        help="Wandb project name. Each config logs as a separate run in a group.",
+    )
     args = parser.parse_args()
 
     run_experiment(
@@ -381,6 +431,7 @@ def main():
         skip_baseline=args.skip_baseline,
         config_name=args.config_name,
         layer_indices=args.layer_indices,
+        wandb_project=args.wandb_project,
     )
 
 
