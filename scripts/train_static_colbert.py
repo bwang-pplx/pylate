@@ -91,7 +91,7 @@ def main():
     parser.add_argument(
         "--tokenizer",
         type=str,
-        default="perplexity-ai/pplx-embed-v1-0.6b",
+        default="perplexity-ai/pplx-embed-v1-late-0.6b",
         help="Tokenizer to use for the static embedding table",
     )
     parser.add_argument(
