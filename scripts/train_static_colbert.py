@@ -130,6 +130,11 @@ def main():
     parser.add_argument("--wandb_project", type=str, default="static-colbert")
     parser.add_argument("--eval_steps", type=int, default=500)
     parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument(
+        "--freeze_embeddings",
+        action="store_true",
+        help="Freeze the embedding table and only train the Dense projection layer",
+    )
     args = parser.parse_args()
 
     os.environ["WANDB_PROJECT"] = args.wandb_project
@@ -166,6 +171,11 @@ def main():
         query_length=args.query_length,
         document_length=args.document_length,
     )
+
+    if args.freeze_embeddings:
+        for param in model[0].embedding.parameters():
+            param.requires_grad = False
+        print("Froze embedding table — only training Dense projection layer")
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
