@@ -230,6 +230,7 @@ def run_experiment(
         model_name_or_path=model_name,
         trust_remote_code=True,
         device=device,
+        document_length=512,
     )
 
     original_layers = get_transformer_layers(model)
