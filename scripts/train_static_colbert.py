@@ -135,6 +135,12 @@ def main():
         action="store_true",
         help="Freeze the embedding table and only train the Dense projection layer",
     )
+    parser.add_argument(
+        "--num_dense_layers",
+        type=int,
+        default=1,
+        help="Number of Dense layers (1=linear projection, 2+=MLP with GELU activations)",
+    )
     args = parser.parse_args()
 
     os.environ["WANDB_PROJECT"] = args.wandb_project
@@ -165,8 +171,33 @@ def main():
             tokenizer, embedding_weights=pretrained_weights
         )
 
+    # Build Dense layers: 1 layer = linear projection, 2+ = MLP with GELU
+    # MLP uses gradual dimension reduction: e.g. 1024->512->256->128
+    from torch import nn
+
+    dense_layers = []
+    if args.num_dense_layers == 1:
+        dense_layers.append(models.Dense(embedding_dim, args.projection_dim))
+    else:
+        # Compute intermediate dims by halving from embedding_dim down to projection_dim
+        dims = [embedding_dim]
+        dim = embedding_dim
+        for i in range(args.num_dense_layers - 1):
+            dim = max(dim // 2, args.projection_dim)
+            dims.append(dim)
+        dims.append(args.projection_dim)
+        # Take the last num_dense_layers+1 entries to ensure correct count
+        dims = dims[: args.num_dense_layers + 1]
+
+        for i in range(args.num_dense_layers):
+            if i < args.num_dense_layers - 1:
+                dense_layers.append(models.Dense(dims[i], dims[i + 1], activation_function=nn.GELU()))
+            else:
+                dense_layers.append(models.Dense(dims[i], args.projection_dim))
+    print(f"Dense layers: {' -> '.join(f'{l.in_features}->{l.out_features}' for l in dense_layers)}")
+
     model = models.ColBERT(
-        modules=[static_embedding, models.Dense(embedding_dim, args.projection_dim)],
+        modules=[static_embedding] + dense_layers,
         device="cpu",
         query_length=args.query_length,
         document_length=args.document_length,
