@@ -1,19 +1,25 @@
-"""Layer pruning experiment for ColBERT models.
+"""Layer pruning experiment for ColBERT models via wandb sweep.
 
-Evaluates how many transformer layers can be removed from a ColBERT model
-while maintaining retrieval quality on NanoBEIR tasks.
+Each pruning config runs as an independent wandb sweep agent, enabling
+parallel execution across multiple GPUs.
 
 Usage:
-    # Run a single strategy
-    uv run python scripts/layer_pruning_experiment.py --strategies uniform
+    # Create sweep and launch 8 agents (one per GPU):
+    bash scripts/run_pruning_experiments.sh
 
-    # Run specific layer counts with a specific strategy
-    uv run python scripts/layer_pruning_experiment.py --strategies tail --keep-layers 24 20 14
+    # Or manually:
+    # 1. Create the sweep
+    python scripts/layer_pruning_experiment.py create-sweep --wandb-project colbert-layer-pruning
 
-    # Run explicit layer indices
-    uv run python scripts/layer_pruning_experiment.py --config-name custom_12L --layer-indices 0 1 2 3 24 25 26 27 --skip-baseline
+    # 2. Launch agents (one per GPU)
+    CUDA_VISIBLE_DEVICES=0 wandb agent <sweep_id>
+    CUDA_VISIBLE_DEVICES=1 wandb agent <sweep_id>
+    ...
 
-    # Results append to the same JSON file across runs
+    # Run a single config without wandb:
+    python scripts/layer_pruning_experiment.py run \
+        --model perplexity-ai/pplx-embed-v1-late-0.6b \
+        --strategy tail --num-layers 14 --device cuda
 """
 
 from __future__ import annotations
@@ -24,22 +30,21 @@ import time
 from pathlib import Path
 
 import torch
+import wandb
 from torch import nn
 
 from pylate import evaluation, models
 
-try:
-    import wandb
+# ---------------------------------------------------------------------------
+# Model helpers
+# ---------------------------------------------------------------------------
 
-    HAS_WANDB = True
-except ImportError:
-    HAS_WANDB = False
+TOTAL_LAYERS = 28  # pplx-embed-v1-late-0.6b
 
 
 def get_transformer_layers(model: models.ColBERT) -> nn.ModuleList:
     """Get the transformer layer list from the model backbone."""
     auto_model = model[0].auto_model
-    # Try common attribute names for the layer list
     for attr in ["layers", "encoder.layer", "layer"]:
         obj = auto_model
         for part in attr.split("."):
@@ -48,7 +53,6 @@ def get_transformer_layers(model: models.ColBERT) -> nn.ModuleList:
                 break
         if obj is not None and isinstance(obj, nn.ModuleList):
             return obj
-    # Fallback: search named modules for a ModuleList with many children
     for name, module in auto_model.named_modules():
         if isinstance(module, nn.ModuleList) and len(module) > 4:
             return module
@@ -58,12 +62,9 @@ def get_transformer_layers(model: models.ColBERT) -> nn.ModuleList:
     )
 
 
-def set_transformer_layers(
-    model: models.ColBERT, layers: nn.ModuleList
-) -> None:
+def set_transformer_layers(model: models.ColBERT, layers: nn.ModuleList) -> None:
     """Set the transformer layer list and update config."""
     auto_model = model[0].auto_model
-    # Find and replace
     for attr in ["layers", "encoder.layer", "layer"]:
         parts = attr.split(".")
         obj = auto_model
@@ -77,167 +78,72 @@ def set_transformer_layers(
                 setattr(obj, parts[-1], layers)
                 auto_model.config.num_hidden_layers = len(layers)
                 return
-    # Fallback
     for name, module in auto_model.named_modules():
         if isinstance(module, nn.ModuleList) and len(module) > 4:
             parent_name = ".".join(name.split(".")[:-1]) if "." in name else ""
             child_name = name.split(".")[-1]
-            parent = auto_model if not parent_name else dict(auto_model.named_modules())[parent_name]
+            parent = (
+                auto_model
+                if not parent_name
+                else dict(auto_model.named_modules())[parent_name]
+            )
             setattr(parent, child_name, layers)
             auto_model.config.num_hidden_layers = len(layers)
             return
     raise RuntimeError("Could not set transformer layers")
 
 
-def prune_layers(
-    model: models.ColBERT, keep_indices: list[int]
-) -> models.ColBERT:
-    """Create a pruned copy of the model keeping only specified layer indices."""
-    original_layers = get_transformer_layers(model)
-    new_layers = nn.ModuleList([original_layers[i] for i in keep_indices])
-    set_transformer_layers(model, new_layers)
-    return model
+# ---------------------------------------------------------------------------
+# Pruning strategies
+# ---------------------------------------------------------------------------
 
 
-def restore_layers(
-    model: models.ColBERT, original_layers: nn.ModuleList
-) -> None:
-    """Restore the original layers after pruning."""
-    set_transformer_layers(model, original_layers)
+def compute_keep_indices(strategy: str, num_keep: int, total: int) -> list[int]:
+    """Compute which layer indices to keep for a given strategy."""
+    if num_keep >= total:
+        return list(range(total))
+
+    if strategy == "full":
+        return list(range(total))
+
+    if strategy == "uniform":
+        step = total / num_keep
+        indices = [int(i * step) for i in range(num_keep)]
+        if 0 not in indices:
+            indices[0] = 0
+        if total - 1 not in indices:
+            indices[-1] = total - 1
+        return sorted(set(indices))
+
+    if strategy == "tail":
+        return list(range(total - num_keep, total))
+
+    if strategy == "head_tail":
+        head = num_keep // 4
+        tail = num_keep - head
+        return sorted(set(list(range(head)) + list(range(total - tail, total))))
+
+    if strategy == "middle_out":
+        half = num_keep // 2
+        return sorted(set(list(range(half)) + list(range(total - half, total))))
+
+    raise ValueError(f"Unknown strategy: {strategy}")
 
 
-def load_existing_results(output_path: str) -> dict:
-    """Load existing results file if it exists."""
-    path = Path(output_path)
-    if path.exists():
-        with open(path) as f:
-            return json.load(f)
-    return {}
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
 
 
-def save_results(output_path: str, results: dict) -> None:
-    """Save results, merging with any existing file."""
-    output_file = Path(output_path)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_file, "w") as f:
-        json.dump(results, f, indent=2)
-
-
-def print_summary(all_results: dict) -> None:
-    """Print a comparison table of all results."""
-    print(f"\n{'='*90}")
-    print("SUMMARY (all experiments)")
-    print(f"{'='*90}")
-    baseline_ndcg = all_results.get("full", {}).get("mean_ndcg@10")
-    print(
-        f"{'Config':<25} {'Layers':>6} {'Params':>8} "
-        f"{'nDCG@10':>10} {'Δ nDCG':>10} {'MRR@10':>10} {'Recall@10':>10} {'Time':>8}"
-    )
-    print("-" * 90)
-    # Sort by num_layers descending
-    sorted_results = sorted(all_results.items(), key=lambda x: -x[1]["num_layers"])
-    for name, r in sorted_results:
-        if baseline_ndcg is not None:
-            delta = r["mean_ndcg@10"] - baseline_ndcg
-            delta_str = f"{delta:+.4f}" if name != "full" else "baseline"
-        else:
-            delta_str = "n/a"
-        print(
-            f"{name:<25} {r['num_layers']:>6} {r['params_M']:>7.1f}M "
-            f"{r['mean_ndcg@10']:>10.4f} {delta_str:>10} "
-            f"{r['mean_mrr@10']:>10.4f} {r['mean_recall@10']:>10.4f} {r['time_s']:>7.1f}s"
-        )
-
-
-def generate_pruning_configs(
-    num_layers: int, strategies: list[str], keep_layers: list[int] | None = None
-) -> dict[str, list[int]]:
-    """Generate layer index configs for different pruning strategies."""
-    if keep_layers is None:
-        keep_layers = [24, 20, 16, 14, 10, 7]
-
-    configs = {"full": list(range(num_layers))}
-
-    if "uniform" in strategies:
-        # Remove layers uniformly spaced, at various reduction levels
-        for keep in keep_layers:
-            if keep >= num_layers:
-                continue
-            step = num_layers / keep
-            indices = [int(i * step) for i in range(keep)]
-            # Always keep first and last layer
-            if 0 not in indices:
-                indices[0] = 0
-            if num_layers - 1 not in indices:
-                indices[-1] = num_layers - 1
-            configs[f"uniform_{keep}L"] = sorted(set(indices))
-
-    if "tail" in strategies:
-        # Keep last N layers (top layers are most semantic)
-        for keep in keep_layers:
-            if keep >= num_layers:
-                continue
-            configs[f"tail_{keep}L"] = list(range(num_layers - keep, num_layers))
-
-    if "head_tail" in strategies:
-        # Keep first few + last few, drop middle
-        for keep in keep_layers:
-            if keep >= num_layers:
-                continue
-            head = keep // 4  # 25% from start
-            tail = keep - head  # 75% from end
-            indices = list(range(head)) + list(range(num_layers - tail, num_layers))
-            configs[f"head_tail_{keep}L"] = sorted(set(indices))
-
-    if "middle_out" in strategies:
-        # Remove from middle, keep edges
-        for keep in keep_layers:
-            if keep >= num_layers:
-                continue
-            half = keep // 2
-            indices = list(range(half)) + list(range(num_layers - half, num_layers))
-            configs[f"middle_out_{keep}L"] = sorted(set(indices))
-
-    return configs
-
-
-def evaluate_config(
-    model: models.ColBERT,
-    dataset_names: list[str],
-    batch_size: int,
-) -> dict:
-    """Run NanoBEIR evaluation and return metrics."""
-    kwargs = {"batch_size": batch_size}
-    if dataset_names is not None:
-        kwargs["dataset_names"] = dataset_names
-    evaluator = evaluation.NanoBEIREvaluator(**kwargs)
-    results = evaluator(model)
-    return results
-
-
-def run_experiment(
+def evaluate_pruned_model(
     model_name: str,
-    datasets: list[str],
-    strategies: list[str],
-    keep_layers: list[int] | None,
-    batch_size: int,
-    output_path: str,
-    device: str | None,
-    skip_baseline: bool = False,
-    config_name: str | None = None,
-    layer_indices: list[int] | None = None,
-    wandb_project: str | None = None,
-):
-    # Initialize wandb
-    use_wandb = wandb_project is not None and HAS_WANDB
-    if wandb_project and not HAS_WANDB:
-        print("WARNING: wandb not installed, skipping wandb logging")
-
-    # Load existing results for appending
-    all_results = load_existing_results(output_path)
-    if all_results:
-        print(f"Loaded {len(all_results)} existing results from {output_path}")
-
+    strategy: str,
+    num_layers: int,
+    device: str | None = None,
+    batch_size: int = 32,
+    datasets: list[str] | None = None,
+) -> dict:
+    """Load model, prune layers, evaluate on NanoBEIR, return metrics."""
     print(f"Loading model: {model_name}")
     model = models.ColBERT(
         model_name_or_path=model_name,
@@ -246,193 +152,238 @@ def run_experiment(
         document_length=512,
     )
 
-    original_layers = get_transformer_layers(model)
-    num_layers = len(original_layers)
-    print(f"Model has {num_layers} transformer layers")
+    total = len(get_transformer_layers(model))
+    keep_indices = compute_keep_indices(strategy, num_layers, total)
 
-    # Keep a reference to original layer list
-    original_layer_list = list(original_layers)
+    config_name = f"{strategy}_{num_layers}L" if strategy != "full" else "full"
+    print(f"Config: {config_name} — keeping {len(keep_indices)}/{total} layers")
+    print(f"Layers: {keep_indices}")
 
-    # Build configs to run
-    if layer_indices is not None:
-        # Explicit layer indices mode
-        name = config_name or f"custom_{len(layer_indices)}L"
-        configs = {name: sorted(layer_indices)}
-    else:
-        configs = generate_pruning_configs(num_layers, strategies, keep_layers)
+    if strategy != "full":
+        original_layers = get_transformer_layers(model)
+        new_layers = nn.ModuleList([original_layers[i] for i in keep_indices])
+        set_transformer_layers(model, new_layers)
 
-    if skip_baseline:
-        configs.pop("full", None)
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
 
-    # Skip configs already evaluated
-    new_configs = {k: v for k, v in configs.items() if k not in all_results}
-    skipped = len(configs) - len(new_configs)
-    if skipped:
-        print(f"Skipping {skipped} already-evaluated configs")
-    configs = new_configs
+    eval_kwargs = {"batch_size": batch_size}
+    if datasets is not None:
+        eval_kwargs["dataset_names"] = datasets
+    evaluator = evaluation.NanoBEIREvaluator(**eval_kwargs)
 
-    if not configs:
-        print("Nothing new to evaluate.")
-        print_summary(all_results)
+    start_time = time.time()
+    metrics = evaluator(model)
+    elapsed = time.time() - start_time
+
+    ndcg10 = metrics.get("NanoBEIR_mean_MaxSim_ndcg@10", 0)
+    mrr10 = metrics.get("NanoBEIR_mean_MaxSim_mrr@10", 0)
+    recall10 = metrics.get("NanoBEIR_mean_MaxSim_recall@10", 0)
+
+    print(f"nDCG@10: {ndcg10:.4f} | MRR@10: {mrr10:.4f} | Recall@10: {recall10:.4f}")
+    print(f"Params: {n_params:.1f}M | Time: {elapsed:.1f}s")
+
+    return {
+        "config_name": config_name,
+        "strategy": strategy,
+        "num_layers": len(keep_indices),
+        "total_layers": total,
+        "layers_kept": keep_indices,
+        "params_M": round(n_params, 1),
+        "time_s": round(elapsed, 1),
+        "mean_ndcg@10": round(ndcg10, 4),
+        "mean_mrr@10": round(mrr10, 4),
+        "mean_recall@10": round(recall10, 4),
+        "all_metrics": {
+            k: round(v, 4) if isinstance(v, float) else v
+            for k, v in metrics.items()
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Wandb sweep
+# ---------------------------------------------------------------------------
+
+STRATEGIES = ["full", "uniform", "tail", "head_tail", "middle_out"]
+LAYER_COUNTS = [28, 24, 20, 16, 14, 10, 7]
+
+
+def build_sweep_config(model_name: str) -> dict:
+    """Build wandb sweep config with grid search over all configs."""
+    # Build explicit (strategy, num_layers) pairs to avoid redundant combos
+    # "full" only runs once at 28 layers; other strategies run at <28 layers
+    params = []
+    for s in STRATEGIES:
+        for n in LAYER_COUNTS:
+            if s == "full" and n == TOTAL_LAYERS:
+                params.append({"strategy": s, "num_layers": n})
+            elif s != "full" and n < TOTAL_LAYERS:
+                params.append({"strategy": s, "num_layers": n})
+
+    return {
+        "name": f"layer-pruning-{model_name.split('/')[-1]}",
+        "method": "grid",
+        "parameters": {
+            "strategy": {"values": list({p["strategy"] for p in params})},
+            "num_layers": {"values": list({p["num_layers"] for p in params})},
+        },
+        "run_cap": len(params),
+    }
+
+
+def sweep_agent_fn():
+    """Function called by each wandb sweep agent."""
+    run = wandb.init()
+    config = wandb.config
+
+    strategy = config.strategy
+    num_layers = config.num_layers
+
+    # Skip invalid combos (full must be 28, others must be <28)
+    if strategy == "full" and num_layers != TOTAL_LAYERS:
+        print(f"Skipping invalid combo: {strategy} with {num_layers} layers")
+        wandb.finish()
+        return
+    if strategy != "full" and num_layers >= TOTAL_LAYERS:
+        print(f"Skipping invalid combo: {strategy} with {num_layers} layers")
+        wandb.finish()
         return
 
-    print(f"\nWill evaluate {len(configs)} configurations:")
-    for name, indices in configs.items():
-        print(f"  {name}: {len(indices)} layers")
+    model_name = run.config.get("model", "perplexity-ai/pplx-embed-v1-late-0.6b")
+    batch_size = run.config.get("batch_size", 32)
 
-    for config_name_iter, keep_indices in configs.items():
-        print(f"\n{'='*60}")
-        print(f"Evaluating: {config_name_iter} ({len(keep_indices)}/{num_layers} layers)")
-        print(f"Layers kept: {keep_indices}")
-        print(f"{'='*60}")
+    result = evaluate_pruned_model(
+        model_name=model_name,
+        strategy=strategy,
+        num_layers=num_layers,
+        batch_size=batch_size,
+    )
 
-        # Restore original layers then prune
-        full_layers = nn.ModuleList(original_layer_list)
-        set_transformer_layers(model, full_layers)
-        if config_name_iter != "full":
-            prune_layers(model, keep_indices)
+    # Log all metrics
+    log_data = {
+        "num_layers": result["num_layers"],
+        "params_M": result["params_M"],
+        "time_s": result["time_s"],
+        "mean_ndcg@10": result["mean_ndcg@10"],
+        "mean_mrr@10": result["mean_mrr@10"],
+        "mean_recall@10": result["mean_recall@10"],
+    }
+    for k, v in result["all_metrics"].items():
+        if isinstance(v, (int, float)):
+            log_data[k] = v
+    wandb.log(log_data)
 
-        # Count parameters
-        n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    # Also save to local JSON
+    output_path = "results/layer_pruning_results.json"
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    existing = {}
+    if output_file.exists():
+        with open(output_file) as f:
+            existing = json.load(f)
+    existing[result["config_name"]] = result
+    with open(output_file, "w") as f:
+        json.dump(existing, f, indent=2)
 
-        start_time = time.time()
-        metrics = evaluate_config(model, datasets, batch_size)
-        elapsed = time.time() - start_time
+    wandb.finish()
 
-        # Extract key metrics
-        ndcg10 = metrics.get("NanoBEIR_mean_MaxSim_ndcg@10", 0)
-        mrr10 = metrics.get("NanoBEIR_mean_MaxSim_mrr@10", 0)
-        recall10 = metrics.get("NanoBEIR_mean_MaxSim_recall@10", 0)
 
-        result = {
-            "config": config_name_iter,
-            "num_layers": len(keep_indices),
-            "layers_kept": keep_indices,
-            "params_M": round(n_params, 1),
-            "time_s": round(elapsed, 1),
-            "mean_ndcg@10": round(ndcg10, 4),
-            "mean_mrr@10": round(mrr10, 4),
-            "mean_recall@10": round(recall10, 4),
-            "all_metrics": {
-                k: round(v, 4) if isinstance(v, float) else v
-                for k, v in metrics.items()
-            },
-        }
-        all_results[config_name_iter] = result
+# ---------------------------------------------------------------------------
+# Standalone run (no wandb)
+# ---------------------------------------------------------------------------
 
-        # Save after each config (incremental, crash-safe)
-        save_results(output_path, all_results)
 
-        # Log to wandb — each config is its own run for sweep-style comparison
-        if use_wandb:
-            strategy = config_name_iter.rsplit("_", 1)[0] if config_name_iter != "full" else "full"
-            run = wandb.init(
-                project=wandb_project,
-                group=f"layer-pruning-{model_name.split('/')[-1]}",
-                name=config_name_iter,
-                config={
-                    "model": model_name,
-                    "strategy": strategy,
-                    "num_layers": len(keep_indices),
-                    "total_layers": num_layers,
-                    "layers_kept": keep_indices,
-                    "params_M": round(n_params, 1),
-                    "batch_size": batch_size,
-                },
-                finish_previous=True,
-            )
-            wandb_log = {
-                "num_layers": len(keep_indices),
-                "params_M": round(n_params, 1),
-                "time_s": round(elapsed, 1),
-                "mean_ndcg@10": ndcg10,
-                "mean_mrr@10": mrr10,
-                "mean_recall@10": recall10,
-            }
-            for k, v in metrics.items():
-                if isinstance(v, (int, float)):
-                    wandb_log[k] = v
-            wandb.log(wandb_log)
-            wandb.finish()
+def run_standalone(args):
+    """Run a single config without wandb."""
+    result = evaluate_pruned_model(
+        model_name=args.model,
+        strategy=args.strategy,
+        num_layers=args.num_layers,
+        device=args.device,
+        batch_size=args.batch_size,
+        datasets=args.datasets,
+    )
 
-        print(f"  nDCG@10: {ndcg10:.4f} | MRR@10: {mrr10:.4f} | Recall@10: {recall10:.4f}")
-        print(f"  Params: {n_params:.1f}M | Time: {elapsed:.1f}s")
+    output_file = Path(args.output)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    existing = {}
+    if output_file.exists():
+        with open(output_file) as f:
+            existing = json.load(f)
+    existing[result["config_name"]] = result
+    with open(output_file, "w") as f:
+        json.dump(existing, f, indent=2)
+    print(f"Results saved to {args.output}")
 
-    print(f"\nResults saved to {output_path}")
-    print_summary(all_results)
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
 def main():
     parser = argparse.ArgumentParser(description="ColBERT layer pruning experiment")
-    parser.add_argument(
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # --- create-sweep ---
+    sp_create = subparsers.add_parser("create-sweep", help="Create a wandb sweep")
+    sp_create.add_argument(
+        "--wandb-project",
+        default="colbert-layer-pruning",
+        help="Wandb project name",
+    )
+    sp_create.add_argument(
+        "--wandb-entity",
+        default=None,
+        help="Wandb entity (team/user)",
+    )
+    sp_create.add_argument(
         "--model",
         default="perplexity-ai/pplx-embed-v1-late-0.6b",
-        help="HuggingFace model name or path",
     )
-    parser.add_argument(
-        "--datasets",
-        nargs="+",
-        default=None,
-        help="NanoBEIR dataset names (default: all 13 datasets)",
-    )
-    parser.add_argument(
-        "--strategies",
-        nargs="+",
-        default=["uniform", "tail", "head_tail", "middle_out"],
-        choices=["uniform", "tail", "head_tail", "middle_out"],
-        help="Pruning strategies to try",
-    )
-    parser.add_argument(
-        "--keep-layers",
-        nargs="+",
-        type=int,
-        default=None,
-        help="Layer counts to try (default: 24 20 16 14 10 7)",
-    )
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument(
-        "--output",
-        default="results/layer_pruning_results.json",
-        help="Output JSON path (results are appended across runs)",
-    )
-    parser.add_argument("--device", default=None, help="Device (cuda, mps, cpu)")
-    parser.add_argument(
-        "--skip-baseline",
-        action="store_true",
-        help="Skip full model baseline evaluation",
-    )
-    parser.add_argument(
-        "--config-name",
-        default=None,
-        help="Name for a custom config (use with --layer-indices)",
-    )
-    parser.add_argument(
-        "--layer-indices",
-        nargs="+",
-        type=int,
-        default=None,
-        help="Explicit layer indices to keep (overrides --strategies)",
-    )
-    parser.add_argument(
-        "--wandb-project",
-        default=None,
-        help="Wandb project name. Each config logs as a separate run in a group.",
-    )
+
+    # --- agent ---
+    sp_agent = subparsers.add_parser("agent", help="Run as a wandb sweep agent")
+    sp_agent.add_argument("sweep_id", help="Wandb sweep ID (entity/project/sweep_id)")
+    sp_agent.add_argument("--count", type=int, default=None, help="Max runs for this agent")
+
+    # --- run (standalone, no wandb) ---
+    sp_run = subparsers.add_parser("run", help="Run a single config without wandb")
+    sp_run.add_argument("--model", default="perplexity-ai/pplx-embed-v1-late-0.6b")
+    sp_run.add_argument("--strategy", required=True, choices=STRATEGIES)
+    sp_run.add_argument("--num-layers", type=int, required=True)
+    sp_run.add_argument("--device", default=None)
+    sp_run.add_argument("--batch-size", type=int, default=32)
+    sp_run.add_argument("--datasets", nargs="+", default=None)
+    sp_run.add_argument("--output", default="results/layer_pruning_results.json")
+
     args = parser.parse_args()
 
-    run_experiment(
-        model_name=args.model,
-        datasets=args.datasets,
-        strategies=args.strategies,
-        keep_layers=args.keep_layers,
-        batch_size=args.batch_size,
-        output_path=args.output,
-        device=args.device,
-        skip_baseline=args.skip_baseline,
-        config_name=args.config_name,
-        layer_indices=args.layer_indices,
-        wandb_project=args.wandb_project,
-    )
+    if args.command == "create-sweep":
+        sweep_config = build_sweep_config(args.model)
+        sweep_config["program"] = "scripts/layer_pruning_experiment.py"
+        # Pass model as a fixed parameter so agents can read it
+        sweep_config["parameters"]["model"] = {
+            "value": args.model,
+        }
+        sweep_config["parameters"]["batch_size"] = {"value": 32}
+        sweep_id = wandb.sweep(
+            sweep_config,
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+        )
+        print(f"\nSweep created: {sweep_id}")
+        print(f"\nTo launch agents:")
+        entity_prefix = f"{args.wandb_entity}/" if args.wandb_entity else ""
+        full_id = f"{entity_prefix}{args.wandb_project}/{sweep_id}"
+        for i in range(8):
+            print(f"  CUDA_VISIBLE_DEVICES={i} python scripts/layer_pruning_experiment.py agent {full_id} &")
+
+    elif args.command == "agent":
+        wandb.agent(args.sweep_id, function=sweep_agent_fn, count=args.count)
+
+    elif args.command == "run":
+        run_standalone(args)
 
 
 if __name__ == "__main__":
