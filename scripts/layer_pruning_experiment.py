@@ -372,10 +372,13 @@ def main():
             project=args.wandb_project,
             entity=args.wandb_entity,
         )
+        # Resolve entity (may come from default login if not specified)
+        entity = args.wandb_entity or wandb.Api().default_entity
+        full_id = f"{entity}/{args.wandb_project}/{sweep_id}"
         print(f"\nSweep created: {sweep_id}")
+        print(f"SWEEP_PATH={full_id}")
+        print(f"URL: https://wandb.ai/{full_id}")
         print(f"\nTo launch agents:")
-        entity_prefix = f"{args.wandb_entity}/" if args.wandb_entity else ""
-        full_id = f"{entity_prefix}{args.wandb_project}/{sweep_id}"
         for i in range(8):
             print(f"  CUDA_VISIBLE_DEVICES={i} python scripts/layer_pruning_experiment.py agent {full_id} &")
 

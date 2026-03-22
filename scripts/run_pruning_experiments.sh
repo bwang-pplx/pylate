@@ -35,19 +35,12 @@ CREATE_OUTPUT=$($PYTHON $SCRIPT create-sweep \
 
 echo "$CREATE_OUTPUT"
 
-# Extract sweep ID from output (last word of the "Sweep created: <id>" line)
-SWEEP_ID=$(echo "$CREATE_OUTPUT" | grep "Sweep created:" | awk '{print $NF}')
+# Extract full sweep path (entity/project/sweep_id) from Python output
+FULL_SWEEP_ID=$(echo "$CREATE_OUTPUT" | grep "SWEEP_PATH=" | cut -d= -f2)
 
-if [[ -z "$SWEEP_ID" ]]; then
+if [[ -z "$FULL_SWEEP_ID" ]]; then
     echo "ERROR: Failed to create sweep"
     exit 1
-fi
-
-# Build full sweep path
-if [[ -n "$WANDB_ENTITY" ]]; then
-    FULL_SWEEP_ID="$WANDB_ENTITY/$WANDB_PROJECT/$SWEEP_ID"
-else
-    FULL_SWEEP_ID="$WANDB_PROJECT/$SWEEP_ID"
 fi
 
 mkdir -p results
@@ -69,7 +62,7 @@ echo ""
 echo "All agents launched. PIDs: ${PIDS[*]}"
 echo "Logs: results/agent_gpu{0..${NUM_GPUS}}.log"
 echo ""
-echo "Monitor at: https://wandb.ai/$WANDB_PROJECT/sweeps/$SWEEP_ID"
+echo "Monitor at: https://wandb.ai/$FULL_SWEEP_ID"
 echo ""
 echo "Waiting for all agents to complete..."
 
