@@ -200,10 +200,10 @@ def evaluate_config(
     batch_size: int,
 ) -> dict:
     """Run NanoBEIR evaluation and return metrics."""
-    evaluator = evaluation.NanoBEIREvaluator(
-        dataset_names=dataset_names,
-        batch_size=batch_size,
-    )
+    kwargs = {"batch_size": batch_size}
+    if dataset_names is not None:
+        kwargs["dataset_names"] = dataset_names
+    evaluator = evaluation.NanoBEIREvaluator(**kwargs)
     results = evaluator(model)
     return results
 
@@ -327,8 +327,8 @@ def main():
     parser.add_argument(
         "--datasets",
         nargs="+",
-        default=["scifact", "nfcorpus", "fiqa2018", "scidocs", "arguana"],
-        help="NanoBEIR dataset names to evaluate on",
+        default=None,
+        help="NanoBEIR dataset names (default: all 13 datasets)",
     )
     parser.add_argument(
         "--strategies",

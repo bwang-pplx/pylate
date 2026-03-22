@@ -13,12 +13,11 @@ set -euo pipefail
 
 MODEL="perplexity-ai/pplx-embed-v1-late-0.6b"
 OUTPUT="results/layer_pruning_results.json"
-DATASETS="scifact nfcorpus fiqa2018 scidocs arguana"
 BATCH_SIZE=32
 SCRIPT="scripts/layer_pruning_experiment.py"
 
 PYTHON=".venv/bin/python"
-RUN="$PYTHON $SCRIPT --model $MODEL --output $OUTPUT --datasets $DATASETS --batch-size $BATCH_SIZE"
+RUN="$PYTHON $SCRIPT --model $MODEL --output $OUTPUT --batch-size $BATCH_SIZE --device cuda"
 
 MODE="${1:-all}"
 
