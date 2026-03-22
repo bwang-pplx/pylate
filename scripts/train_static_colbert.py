@@ -176,7 +176,7 @@ def main():
     train_loss = losses.Contrastive(
         model=model,
         temperature=args.temp,
-        gather_across_devices=True,
+        gather_across_devices=False,
     )
 
     # Evaluator
