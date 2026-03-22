@@ -149,7 +149,6 @@ def evaluate_pruned_model(
         model_name_or_path=model_name,
         trust_remote_code=True,
         device=device,
-        document_length=512,
     )
 
     total = len(get_transformer_layers(model))
@@ -208,46 +207,43 @@ STRATEGIES = ["full", "uniform", "tail", "head_tail", "middle_out"]
 LAYER_COUNTS = [28, 24, 20, 16, 14, 10, 7]
 
 
-def build_sweep_config(model_name: str) -> dict:
-    """Build wandb sweep config with grid search over all configs."""
-    # Build explicit (strategy, num_layers) pairs to avoid redundant combos
-    # "full" only runs once at 28 layers; other strategies run at <28 layers
-    params = []
+def build_valid_configs() -> list[str]:
+    """Build list of valid 'strategy:num_layers' config strings."""
+    configs = []
     for s in STRATEGIES:
         for n in LAYER_COUNTS:
             if s == "full" and n == TOTAL_LAYERS:
-                params.append({"strategy": s, "num_layers": n})
+                configs.append(f"{s}:{n}")
             elif s != "full" and n < TOTAL_LAYERS:
-                params.append({"strategy": s, "num_layers": n})
+                configs.append(f"{s}:{n}")
+    return configs
 
+
+def build_sweep_config(model_name: str) -> dict:
+    """Build wandb sweep config with grid search over all valid configs."""
+    configs = build_valid_configs()
     return {
         "name": f"layer-pruning-{model_name.split('/')[-1]}",
         "method": "grid",
         "parameters": {
-            "strategy": {"values": list({p["strategy"] for p in params})},
-            "num_layers": {"values": list({p["num_layers"] for p in params})},
+            # Single parameter encodes both strategy and num_layers
+            "config": {"values": configs},
         },
-        "run_cap": len(params),
     }
 
 
 def sweep_agent_fn():
     """Function called by each wandb sweep agent."""
     run = wandb.init()
-    config = wandb.config
 
-    strategy = config.strategy
-    num_layers = config.num_layers
+    # Parse "strategy:num_layers" config string
+    config_str = wandb.config.config
+    strategy, num_layers_str = config_str.split(":")
+    num_layers = int(num_layers_str)
 
-    # Skip invalid combos (full must be 28, others must be <28)
-    if strategy == "full" and num_layers != TOTAL_LAYERS:
-        print(f"Skipping invalid combo: {strategy} with {num_layers} layers")
-        wandb.finish()
-        return
-    if strategy != "full" and num_layers >= TOTAL_LAYERS:
-        print(f"Skipping invalid combo: {strategy} with {num_layers} layers")
-        wandb.finish()
-        return
+    # Set a readable run name
+    config_name = f"{strategy}_{num_layers}L" if strategy != "full" else "full"
+    run.name = config_name
 
     model_name = run.config.get("model", "perplexity-ai/pplx-embed-v1-late-0.6b")
     batch_size = run.config.get("batch_size", 32)
