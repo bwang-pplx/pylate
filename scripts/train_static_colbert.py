@@ -200,6 +200,7 @@ def main():
         dataloader_num_workers=0,
         dataloader_pin_memory=True,
         dataloader_drop_last=True,
+        accelerator_config={"split_batches": True},
         ddp_find_unused_parameters=False,
         report_to="wandb",
     )
