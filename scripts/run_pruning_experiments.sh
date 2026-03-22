@@ -50,6 +50,8 @@ else
     FULL_SWEEP_ID="$WANDB_PROJECT/$SWEEP_ID"
 fi
 
+mkdir -p results
+
 echo ""
 echo "Launching $NUM_GPUS agents for sweep: $FULL_SWEEP_ID"
 echo ""
