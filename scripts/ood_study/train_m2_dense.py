@@ -45,7 +45,7 @@ def main():
 
     # Dense bi-encoder with mean pooling (sentence-transformers default)
     model = SentenceTransformer(args.backbone)
-    model.max_seq_length = 512
+    model.max_seq_length = 256
 
     # MultipleNegativesRankingLoss = InfoNCE with in-batch negatives
     train_loss = MultipleNegativesRankingLoss(model=model)

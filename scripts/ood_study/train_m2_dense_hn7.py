@@ -52,7 +52,7 @@ def main():
     dataset = dataset.rename_column("negative_1", "negative")
 
     model = SentenceTransformer(args.backbone)
-    model.max_seq_length = 512
+    model.max_seq_length = 256
 
     train_loss = MultipleNegativesRankingLoss(model=model)
 
