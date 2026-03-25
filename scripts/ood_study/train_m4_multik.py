@@ -60,8 +60,6 @@ def main():
         query_length=args.query_length,
         document_length=args.document_length,
     )
-    model = torch.compile(model)
-
     train_loss = losses.Contrastive(
         model=model,
         temperature=args.temperature,

@@ -58,8 +58,6 @@ def main():
         query_length=args.query_length,
         document_length=args.document_length,
     )
-    model = torch.compile(model)
-
     # Loss: InfoNCE with in-batch negatives + 1 hard negative
     train_loss = losses.Contrastive(
         model=model,

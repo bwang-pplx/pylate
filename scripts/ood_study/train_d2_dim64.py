@@ -64,8 +64,6 @@ def main():
 
     # Freeze backbone, only train projection head
     freeze_backbone(model)
-    model = torch.compile(model)
-
     train_loss = losses.Contrastive(
         model=model,
         temperature=args.temperature,
