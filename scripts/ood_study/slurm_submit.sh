@@ -8,8 +8,8 @@
 #   bash scripts/ood_study/slurm_submit.sh
 
 QOS="search"             # SLURM QoS
-GPUS=1                   # GPUs per job
-CPUS=8                   # CPUs per job (for dataloaders)
+GPUS=4                   # GPUs per job
+CPUS=32                  # CPUs per job (for dataloaders)
 MEM="64G"                # Memory per job
 TIME="24:00:00"          # Max wall time per job
 OUTPUT_DIR="output/ood_study"
@@ -21,7 +21,7 @@ mkdir -p "$LOG_DIR"
 submit() {
     local JOB_NAME=$1
     shift
-    local CMD="export TORCH_COMPILE_DISABLE=1 && $@"
+    local CMD="export TORCH_COMPILE_DISABLE=1 && accelerate launch --num_processes $GPUS $@"
 
     sbatch \
         --job-name="$JOB_NAME" \
