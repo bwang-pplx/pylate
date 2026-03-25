@@ -33,7 +33,7 @@ def main():
     parser.add_argument("--embedding_size", type=int, default=128)
     parser.add_argument("--query_length", type=int, default=32)
     parser.add_argument("--document_length", type=int, default=256)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-6)
     parser.add_argument("--warmup_steps", type=int, default=1000)
     parser.add_argument("--max_steps", type=int, default=100000)
