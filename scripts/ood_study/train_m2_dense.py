@@ -55,8 +55,6 @@ def main():
         max_steps=args.max_steps,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
-        eval_strategy="steps",
-        eval_steps=5000,
         save_steps=5000,
         logging_steps=100,
         fp16=False,
