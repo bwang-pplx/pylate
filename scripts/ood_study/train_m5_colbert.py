@@ -78,7 +78,7 @@ def main():
 
         eval_strategy="steps",
         eval_steps=5000,
-        save_steps=5000,
+        save_steps=25000,
         logging_steps=100,
         fp16=False,
         bf16=True,

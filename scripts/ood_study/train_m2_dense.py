@@ -57,7 +57,7 @@ def main():
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
 
-        save_steps=5000,
+        save_steps=25000,
         logging_steps=100,
         fp16=False,
         bf16=True,
