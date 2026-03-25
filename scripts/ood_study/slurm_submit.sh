@@ -21,7 +21,7 @@ mkdir -p "$LOG_DIR"
 submit() {
     local JOB_NAME=$1
     shift
-    local CMD="$@"
+    local CMD="export TORCH_COMPILE_DISABLE=1 && $@"
 
     sbatch \
         --job-name="$JOB_NAME" \
