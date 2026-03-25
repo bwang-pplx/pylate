@@ -65,9 +65,6 @@ def main():
         gather_across_devices=True,
     )
 
-    # Evaluator
-    dev_evaluator = evaluation.NanoBEIREvaluator()
-
     # Training arguments
     training_args = SentenceTransformerTrainingArguments(
         output_dir=output_dir,
@@ -76,8 +73,7 @@ def main():
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
 
-        eval_strategy="steps",
-        eval_steps=5000,
+
         save_steps=25000,
         logging_steps=100,
         fp16=False,
@@ -98,7 +94,7 @@ def main():
         args=training_args,
         train_dataset=dataset,
         loss=train_loss,
-        evaluator=dev_evaluator,
+
         data_collator=utils.ColBERTCollator(tokenize_fn=model.tokenize),
     )
 
