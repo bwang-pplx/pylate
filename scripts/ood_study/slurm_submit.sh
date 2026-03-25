@@ -8,6 +8,7 @@
 #   bash scripts/ood_study/slurm_submit.sh
 
 PARTITION="gpu"          # SLURM partition
+QOS="search"             # SLURM QoS
 GPUS=1                   # GPUs per job
 CPUS=8                   # CPUs per job (for dataloaders)
 MEM="64G"                # Memory per job
@@ -26,6 +27,7 @@ submit() {
     sbatch \
         --job-name="$JOB_NAME" \
         --partition="$PARTITION" \
+        --qos="$QOS" \
         --gres=gpu:$GPUS \
         --cpus-per-task=$CPUS \
         --mem=$MEM \
