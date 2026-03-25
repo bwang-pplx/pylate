@@ -27,7 +27,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train M2 Dense with 7 hard negatives")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--backbone", type=str, default="answerdotai/ModernBERT-base")
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-6)
     parser.add_argument("--warmup_steps", type=int, default=1000)
     parser.add_argument("--max_steps", type=int, default=100000)
@@ -62,6 +62,7 @@ def main():
         max_steps=args.max_steps,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=4,
         save_steps=5000,
         logging_steps=100,
         fp16=False,
