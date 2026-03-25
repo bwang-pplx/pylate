@@ -45,21 +45,21 @@ COMMON="--output_dir $OUTPUT_DIR --wandb_project $WANDB_PROJECT"
 
 # M5: ColBERT-Full
 for SEED in 1 2 3; do
-    submit "m5-s${SEED}" "python scripts/ood_study/train_m5_colbert.py --seed $SEED $COMMON"
+    submit "m5-s${SEED}" "scripts/ood_study/train_m5_colbert.py --seed $SEED $COMMON"
 done
 
 # M2: Dense mean-pool
 for SEED in 1 2 3; do
-    submit "m2-s${SEED}" "python scripts/ood_study/train_m2_dense.py --seed $SEED $COMMON"
+    submit "m2-s${SEED}" "scripts/ood_study/train_m2_dense.py --seed $SEED $COMMON"
 done
 
 # CE: Cross-Encoder (single seed)
-submit "ce-s1" "python scripts/ood_study/train_ce.py --seed 1 $COMMON"
+submit "ce-s1" "scripts/ood_study/train_ce.py --seed 1 $COMMON"
 
 # M4: Multi-K (uncomment when stride-pool is implemented)
 # for K in 4 8 16; do
 #     for SEED in 1 2 3; do
-#         submit "m4-K${K}-s${SEED}" "python scripts/ood_study/train_m4_multik.py --K $K --seed $SEED $COMMON"
+#         submit "m4-K${K}-s${SEED}" "scripts/ood_study/train_m4_multik.py --K $K --seed $SEED $COMMON"
 #     done
 # done
 
@@ -69,18 +69,18 @@ submit "ce-s1" "python scripts/ood_study/train_ce.py --seed 1 $COMMON"
 
 # A2-nat: MeanSim
 for SEED in 1 2 3; do
-    submit "a2nat-s${SEED}" "python scripts/ood_study/train_a2nat_meansim.py --seed $SEED $COMMON"
+    submit "a2nat-s${SEED}" "scripts/ood_study/train_a2nat_meansim.py --seed $SEED $COMMON"
 done
 
 # D2: dim=64
 for SEED in 1 2 3; do
-    submit "d2-s${SEED}" "python scripts/ood_study/train_d2_dim64.py --seed $SEED $COMMON"
+    submit "d2-s${SEED}" "scripts/ood_study/train_d2_dim64.py --seed $SEED $COMMON"
 done
 
 # HN-7 confound check
 for SEED in 1 2 3; do
-    submit "m5-hn7-s${SEED}" "python scripts/ood_study/train_m5_hn7.py --seed $SEED $COMMON"
-    submit "m2-hn7-s${SEED}" "python scripts/ood_study/train_m2_dense_hn7.py --seed $SEED $COMMON"
+    submit "m5-hn7-s${SEED}" "scripts/ood_study/train_m5_hn7.py --seed $SEED $COMMON"
+    submit "m2-hn7-s${SEED}" "scripts/ood_study/train_m2_dense_hn7.py --seed $SEED $COMMON"
 done
 
 echo ""
