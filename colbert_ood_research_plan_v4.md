@@ -115,17 +115,13 @@ A2-zs vs A2-nat → How much the training aggregation shapes the representation 
 - A2-nat may use independently tuned lr/batch size (goal: best possible performance under MeanSim, not hyperparameter uniformity)
 - Fallback: even if A2-nat fails to train well, A2-zs >> A4 still demonstrates that H1 contributes
 
-**Supplementary: iso-storage token count vs dimensionality**
-
-To further probe H1, we compare two ways to halve ColBERT's storage:
+**Supplementary: effect of dimensionality on OOD**
 
 | ID | Token Count | Dimension | Storage | Protocol |
 |----|-------------|-----------|---------|----------|
 | D2 | N | 64 | 0.5x | Retrain projection head only (backbone frozen), lr=1e-4 |
-| D4 | N/2 | 128 | 0.5x | Post-hoc IDF pruning on M5 |
-| D5 | N/4 | 128 | 0.25x | Post-hoc IDF pruning on M5 |
 
-D2 vs D4 at matched 0.5x storage: if D4 (fewer tokens, full dim) hurts OOD more than D2 (full tokens, lower dim), then token count — not per-token representation quality — is what drives OOD robustness, strengthening the H1 interpretation.
+D2 shows how reducing per-token dimensionality (while keeping all tokens) affects OOD robustness. If D2 retains most of the OOD advantage over A4, then per-token representation quality is less important than having multiple tokens.
 
 ### 3.3 Group B — Testing H3 (Paper §3.2)
 
@@ -171,7 +167,7 @@ If the OOD gap remains stable → the architectural effect is robust. If the gap
 | Interaction > 0 | H1×H2 synergy: the factors are super-additive |
 | B2 ≈ B1 | H3 ruled out as a primary factor |
 | C2 ≈ M5 | H4 supported: intrinsic redundancy provides robustness |
-| D4 > D2 (iso-storage) | Token count drives OOD; dimensionality drives ID |
+| D2 retains OOD advantage over A4 | Per-token dim less important than having multiple tokens |
 | HN gap stable | Architectural effect is robust to training signal strength |
 
 ---
@@ -190,7 +186,6 @@ Week 3–4: Ablations
   A2-nat (with convergence monitoring)
   A2-zs (inference-only on M5 checkpoint)
   D2 retrain projection head
-  D4/D5 post-hoc pruning (inference-only)
   HN check: M2 + M5 × {1, 7}
 
 Week 5: Targeted Checks + Analysis
@@ -210,10 +205,10 @@ Week 6–7: Writing
 §1 Introduction: "multi-vector helps OOD" is established; "why" is not
 §2 The Spectrum: BM25 → Dense → Multi-K → ColBERT → CE (establish the fact)
 §3 Decomposition:
-   §3.1 H1 vs H2 (Group A + synergy test + iso-storage D2/D4 evidence)
+   §3.1 H1 vs H2 (Group A + synergy test + D2 dimensionality evidence)
    §3.2 H3 check (Group B)
    §3.3 H4 check (Group C)
-§4 Discussion (practical implications: Pareto tradeoff from spectrum + D2/D4/D5,
+§4 Discussion (practical implications: D2 dimensionality tradeoff,
    HN sensitivity, limitations)
 §5 Conclusion
 Appendix: A2-nat convergence details, per-dataset results, HN sensitivity
@@ -242,10 +237,8 @@ Appendix: A2-nat convergence details, per-dataset results, HN sensitivity
 | Config | Derived from | Modification |
 |--------|-------------|--------------|
 | A2-zs | M5 checkpoint | Eval with `aggregation="mean"` |
-| M6 (pruned 50%) | M5 checkpoint | Post-hoc IDF pruning |
-| M7 (pruned 75%) | M5 checkpoint | Post-hoc IDF pruning |
-| D4 (N/2 tokens) | M5 checkpoint | Post-hoc IDF pruning |
-| D5 (N/4 tokens) | M5 checkpoint | Post-hoc IDF pruning |
+| M6 (pruned 50%) | M5 checkpoint | Post-hoc token pruning |
+| M7 (pruned 75%) | M5 checkpoint | Post-hoc token pruning |
 | B2 (mask exact) | M5 checkpoint | Mask cos > θ matches at inference |
 | B4 (Dense+BM25) | M2 + BM25 scores | Linear combo, tune α on dev |
 | C2 (token dropout) | M5 checkpoint | Random 30% doc token dropout |
@@ -264,7 +257,7 @@ Appendix: A2-nat convergence details, per-dataset results, HN sensitivity
 
 ```
 Trained models:  M2, M4×3, M5, A2-nat, D2, HN-7×2, CE = 10 configs
-Inference-only:  A2-zs, M6, M7, D4, D5, B2, B4, C2 = 8 configs (no training)
+Inference-only:  A2-zs, M6, M7, B2, B4, C2 = 6 configs (no training)
 BM25:            MTEB BM25-S, ~0 cost
 
 Total training runs: 10
