@@ -74,6 +74,8 @@ def main():
         per_device_eval_batch_size=args.batch_size,
 
 
+        eval_strategy="steps",
+        eval_steps=5000,
         save_steps=25000,
         logging_steps=100,
         fp16=False,
@@ -88,13 +90,16 @@ def main():
         report_to="wandb",
     )
 
+    # Evaluator
+    dev_evaluator = evaluation.NanoBEIREvaluator()
+
     # Trainer
     trainer = SentenceTransformerTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
         loss=train_loss,
-
+        evaluator=dev_evaluator,
         data_collator=utils.ColBERTCollator(tokenize_fn=model.tokenize),
     )
 
