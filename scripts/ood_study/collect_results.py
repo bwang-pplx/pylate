@@ -26,13 +26,12 @@ MODELS = {
 }
 
 # Inference-only variants stored under m5 checkpoints
+# M6/D4 are identical (50% IDF pruning on M5), M7/D5 are identical (25%)
 INFERENCE_VARIANTS = {
     "a2zs-meansim": ("A2-zs: MeanSim (zero-shot)", "_meansim"),
     "c2-dropout30": ("C2: 30% dropout", "_dropout30"),
-    "m6-prune50": ("M6: pruned 50%", "_prune50"),
-    "m7-prune75": ("M7: pruned 75%", "_prune25"),
-    "d4-prune50": ("D4: N/2 tokens", "_prune50"),
-    "d5-prune75": ("D5: N/4 tokens", "_prune25"),
+    "m6-prune50": ("M6/D4: pruned 50%", "_prune50"),
+    "m7-prune75": ("M7/D5: pruned 75%", "_prune25"),
 }
 
 BEIR_DATASETS = [
