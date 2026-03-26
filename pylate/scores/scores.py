@@ -6,11 +6,37 @@ import torch
 from ..utils.tensor import convert_to_tensor
 
 
+def _aggregate_scores(
+    scores: torch.Tensor,
+    aggregation: str = "max",
+) -> torch.Tensor:
+    """Aggregate token-level similarity scores along the document token dimension.
+
+    Parameters
+    ----------
+    scores
+        Token-level similarity scores. The last dimension corresponds to document tokens.
+    aggregation
+        Aggregation strategy: ``"max"`` for MaxSim (standard ColBERT) or ``"mean"`` for
+        MeanSim (average similarity per query token).
+
+    """
+    if aggregation == "max":
+        return scores.max(axis=-1).values.sum(axis=-1)
+    elif aggregation == "mean":
+        return scores.mean(axis=-1).sum(axis=-1)
+    else:
+        raise ValueError(
+            f"Unknown aggregation '{aggregation}'. Choose 'max' or 'mean'."
+        )
+
+
 def colbert_scores(
     queries_embeddings: list | np.ndarray | torch.Tensor,
     documents_embeddings: list | np.ndarray | torch.Tensor,
     queries_mask: torch.Tensor | None = None,
     documents_mask: torch.Tensor | None = None,
+    aggregation: str = "max",
 ) -> torch.Tensor:
     """Computes the ColBERT scores between queries and documents embeddings. The score is computed as the sum of maximum similarities
     between the query and the document.
@@ -25,6 +51,9 @@ def colbert_scores(
         The mask for the queries embeddings. Shape: (batch_size, num tokens queries)
     documents_mask
         The mask for the documents embeddings. Shape: (batch_size, num tokens documents)
+    aggregation
+        Aggregation strategy over document tokens: ``"max"`` for MaxSim (default) or
+        ``"mean"`` for MeanSim.
 
     Examples
     --------
@@ -80,13 +109,14 @@ def colbert_scores(
     if documents_mask is not None:
         documents_mask = convert_to_tensor(documents_mask)
         scores = scores * documents_mask.unsqueeze(0).unsqueeze(2)
-    scores = scores.max(axis=-1).values.sum(axis=-1)
+    scores = _aggregate_scores(scores, aggregation=aggregation)
     return scores
 
 
 def colbert_scores_pairwise(
     queries_embeddings: torch.Tensor,
     documents_embeddings: torch.Tensor,
+    aggregation: str = "max",
 ) -> torch.Tensor:
     """Computes the ColBERT score for each query-document pair. The score is computed as the sum of maximum similarities
     between the query and the document for corresponding pairs.
@@ -97,6 +127,9 @@ def colbert_scores_pairwise(
         The first tensor. The queries embeddings. Shape: (batch_size, num tokens queries, embedding_size)
     documents_embeddings
         The second tensor. The documents embeddings. Shape: (batch_size, num tokens documents, embedding_size)
+    aggregation
+        Aggregation strategy over document tokens: ``"max"`` for MaxSim (default) or
+        ``"mean"`` for MeanSim.
 
     Examples
     --------
@@ -137,7 +170,14 @@ def colbert_scores_pairwise(
             document_embedding,
         )
 
-        scores.append(query_document_score.max(axis=-1).values.sum())
+        if aggregation == "max":
+            scores.append(query_document_score.max(axis=-1).values.sum())
+        elif aggregation == "mean":
+            scores.append(query_document_score.mean(axis=-1).sum())
+        else:
+            raise ValueError(
+                f"Unknown aggregation '{aggregation}'. Choose 'max' or 'mean'."
+            )
 
     return torch.stack(scores, dim=0)
 
@@ -147,6 +187,7 @@ def colbert_kd_scores(
     documents_embeddings: list | np.ndarray | torch.Tensor,
     queries_mask: torch.Tensor = None,
     documents_mask: torch.Tensor = None,
+    aggregation: str = "max",
 ) -> torch.Tensor:
     """Computes the ColBERT scores between queries and documents embeddings. This scoring function is dedicated to the knowledge distillation pipeline.
 
@@ -201,5 +242,5 @@ def colbert_kd_scores(
         mask = convert_to_tensor(documents_mask)
         scores = scores * mask.unsqueeze(2)
 
-    scores = scores.max(axis=-1).values.sum(axis=-1)
+    scores = _aggregate_scores(scores, aggregation=aggregation)
     return scores
