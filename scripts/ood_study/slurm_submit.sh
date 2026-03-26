@@ -32,6 +32,7 @@ submit() {
         --time=$TIME \
         --output="$LOG_DIR/${JOB_NAME}_%j.out" \
         --error="$LOG_DIR/${JOB_NAME}_%j.err" \
+        --chdir="$PWD" \
         --wrap="$CMD"
 
     echo "Submitted: $JOB_NAME"
