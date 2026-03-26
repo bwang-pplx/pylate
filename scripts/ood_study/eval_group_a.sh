@@ -17,19 +17,19 @@ mkdir -p "$LOG_DIR"
 # A1 (= M5 ColBERT MaxSim) — PLAID eval
 sbatch --job-name="eval-a1" --qos=$QOS --gres=gpu:$GPUS --cpus-per-task=$CPUS --mem=$MEM --time=$TIME \
     --output="$LOG_DIR/eval-a1_%j.out" --error="$LOG_DIR/eval-a1_%j.err" \
-    --wrap="export TORCH_COMPILE_DISABLE=1 && python scripts/eval_beir.py --model $COMMON_DIR/m5-colbert-seed1/final --document_length 256 --dataset all"
+    --wrap="export TORCH_COMPILE_DISABLE=1 && python scripts/eval_beir.py --model $COMMON_DIR/m5-colbert-seed1/final --document_length 512 --dataset all"
 echo "Submitted: eval-a1"
 
 # A2-zs (M5 checkpoint, MeanSim at inference) — brute-force
 sbatch --job-name="eval-a2zs" --qos=$QOS --gres=gpu:$GPUS --cpus-per-task=$CPUS --mem=$MEM --time=$TIME \
     --output="$LOG_DIR/eval-a2zs_%j.out" --error="$LOG_DIR/eval-a2zs_%j.err" \
-    --wrap="export TORCH_COMPILE_DISABLE=1 && python scripts/ood_study/eval_colbert_beir.py --model $COMMON_DIR/m5-colbert-seed1/final --aggregation mean --dataset all"
+    --wrap="export TORCH_COMPILE_DISABLE=1 && python scripts/ood_study/eval_colbert_beir.py --model $COMMON_DIR/m5-colbert-seed1/final --aggregation mean --document_length 512 --dataset all"
 echo "Submitted: eval-a2zs"
 
 # A2-nat (MeanSim trained, MeanSim eval) — brute-force
 sbatch --job-name="eval-a2nat" --qos=$QOS --gres=gpu:$GPUS --cpus-per-task=$CPUS --mem=$MEM --time=$TIME \
     --output="$LOG_DIR/eval-a2nat_%j.out" --error="$LOG_DIR/eval-a2nat_%j.err" \
-    --wrap="export TORCH_COMPILE_DISABLE=1 && python scripts/ood_study/eval_colbert_beir.py --model $COMMON_DIR/a2nat-meansim-seed1/final --aggregation mean --dataset all"
+    --wrap="export TORCH_COMPILE_DISABLE=1 && python scripts/ood_study/eval_colbert_beir.py --model $COMMON_DIR/a2nat-meansim-seed1/final --aggregation mean --document_length 512 --dataset all"
 echo "Submitted: eval-a2nat"
 
 # A4 (= M2 Dense mean-pool) — MTEB eval
