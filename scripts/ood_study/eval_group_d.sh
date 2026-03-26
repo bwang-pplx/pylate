@@ -1,6 +1,5 @@
 #!/bin/bash
-# Evaluate Group D experiments: D2, D4, D5
-# Iso-storage comparison: reduce dim vs reduce tokens
+# Evaluate D2 (dim=64 ColBERT)
 
 set -e
 
@@ -19,18 +18,3 @@ sbatch --job-name="eval-d2" --qos=$QOS --gres=gpu:$GPUS --cpus-per-task=$CPUS --
     --chdir="$PWD" --output="$LOG_DIR/eval-d2_%j.out" --error="$LOG_DIR/eval-d2_%j.err" \
     --wrap="export TORCH_COMPILE_DISABLE=1 && python scripts/eval_beir.py --model $COMMON_DIR/d2-dim64-seed1/final --document_length 512 --dataset all"
 echo "Submitted: eval-d2"
-
-# D4 (N/2 tokens, IDF pruning on M5) — brute-force
-sbatch --job-name="eval-d4" --qos=$QOS --gres=gpu:$GPUS --cpus-per-task=$CPUS --mem=$MEM --time=$TIME \
-    --chdir="$PWD" --output="$LOG_DIR/eval-d4_%j.out" --error="$LOG_DIR/eval-d4_%j.err" \
-    --wrap="export TORCH_COMPILE_DISABLE=1 && python scripts/ood_study/eval_colbert_beir.py --model $COMMON_DIR/m5-colbert-seed1/final --idf_prune 0.5 --document_length 512 --dataset all"
-echo "Submitted: eval-d4"
-
-# D5 (N/4 tokens, IDF pruning on M5) — brute-force
-sbatch --job-name="eval-d5" --qos=$QOS --gres=gpu:$GPUS --cpus-per-task=$CPUS --mem=$MEM --time=$TIME \
-    --chdir="$PWD" --output="$LOG_DIR/eval-d5_%j.out" --error="$LOG_DIR/eval-d5_%j.err" \
-    --wrap="export TORCH_COMPILE_DISABLE=1 && python scripts/ood_study/eval_colbert_beir.py --model $COMMON_DIR/m5-colbert-seed1/final --idf_prune 0.25 --document_length 512 --dataset all"
-echo "Submitted: eval-d5"
-
-echo ""
-echo "3 eval jobs submitted. Check status: squeue -u \$USER"
