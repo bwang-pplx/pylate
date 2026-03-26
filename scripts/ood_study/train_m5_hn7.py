@@ -35,7 +35,7 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-6)
     parser.add_argument("--warmup_steps", type=int, default=1000)
     parser.add_argument("--max_steps", type=int, default=100000)
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=0.03)
     parser.add_argument("--num_negatives", type=int, default=7)
     parser.add_argument("--output_dir", type=str, default="output/ood_study")
     parser.add_argument("--wandb_project", type=str, default="ood-study")
