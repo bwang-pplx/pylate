@@ -17,7 +17,7 @@ mkdir -p "$LOG_DIR"
 # A1 (= M5 ColBERT MaxSim) — PLAID eval
 sbatch --job-name="eval-a1" --qos=$QOS --gres=gpu:$GPUS --cpus-per-task=$CPUS --mem=$MEM --time=$TIME \
     --output="$LOG_DIR/eval-a1_%j.out" --error="$LOG_DIR/eval-a1_%j.err" \
-    --wrap="export TORCH_COMPILE_DISABLE=1 && python scripts/eval_beir.py --model $COMMON_DIR/m5-colbert-seed1/final --dataset all"
+    --wrap="export TORCH_COMPILE_DISABLE=1 && python scripts/eval_beir.py --model $COMMON_DIR/m5-colbert-seed1/final --document_length 256 --dataset all"
 echo "Submitted: eval-a1"
 
 # A2-zs (M5 checkpoint, MeanSim at inference) — brute-force
