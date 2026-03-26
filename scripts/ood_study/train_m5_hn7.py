@@ -34,7 +34,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-6)
     parser.add_argument("--warmup_steps", type=int, default=1000)
-    parser.add_argument("--max_steps", type=int, default=100000)
+    parser.add_argument("--max_steps", type=int, default=12500)
     parser.add_argument("--temperature", type=float, default=0.03)
     parser.add_argument("--num_negatives", type=int, default=7)
     parser.add_argument("--output_dir", type=str, default="output/ood_study")
@@ -66,7 +66,7 @@ def main():
     train_loss = losses.Contrastive(
         model=model,
         temperature=args.temperature,
-
+        gather_across_devices=True,
     )
 
     training_args = SentenceTransformerTrainingArguments(
@@ -77,7 +77,7 @@ def main():
         per_device_eval_batch_size=args.batch_size,
 
 
-        save_steps=25000,
+        save_steps=5000,
         logging_steps=100,
         fp16=False,
         bf16=True,

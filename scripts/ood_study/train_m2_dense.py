@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-6)
     parser.add_argument("--warmup_steps", type=int, default=1000)
-    parser.add_argument("--max_steps", type=int, default=100000)
+    parser.add_argument("--max_steps", type=int, default=12500)
     parser.add_argument("--output_dir", type=str, default="output/ood_study")
     parser.add_argument("--wandb_project", type=str, default="ood-study")
     args = parser.parse_args()
@@ -57,7 +57,7 @@ def main():
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
 
-        save_steps=25000,
+        save_steps=5000,
         logging_steps=100,
         fp16=False,
         bf16=True,
