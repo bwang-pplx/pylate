@@ -63,7 +63,7 @@ def main():
         model=model,
         score_metric=meansim_scores,
         temperature=args.temperature,
-        gather_across_devices=True,
+
     )
 
     training_args = SentenceTransformerTrainingArguments(
@@ -84,7 +84,7 @@ def main():
         dataloader_pin_memory=True,
         dataloader_drop_last=True,
         seed=args.seed,
-        accelerator_config={"split_batches": True},
+
         report_to="wandb",
     )
 

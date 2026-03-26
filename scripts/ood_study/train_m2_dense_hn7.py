@@ -73,7 +73,7 @@ def main():
         dataloader_pin_memory=True,
         dataloader_drop_last=True,
         seed=args.seed,
-        accelerator_config={"split_batches": True},
+
         report_to="wandb",
     )
 
