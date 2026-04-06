@@ -50,7 +50,8 @@ def train_run(
     contrastive_temperature: float = 0.03,
     wandb_project: str = "ablation-self-distillation",
 ):
-    run_name = f"ablation-{loss_name}-modernbert-base"
+    model_short = model_name.split("/")[-1]
+    run_name = f"ablation-{loss_name}-{model_short}"
     output_dir = f"output/{run_name}"
 
     os.environ["WANDB_PROJECT"] = wandb_project
@@ -59,6 +60,7 @@ def train_run(
     model = models.ColBERT(
         model_name_or_path=model_name,
         document_length=document_length,
+        trust_remote_code=True,
     )
 
     # Dataset: MS MARCO triplets (query, positive, negative) — 502,931 samples
