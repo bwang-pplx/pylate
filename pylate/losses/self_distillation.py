@@ -36,7 +36,8 @@ class SelfDistillation(nn.Module):
         Whether to gather embeddings across devices for more in-batch negatives.
     T_teacher
         Teacher temperature. Lower values produce sharper (more confident)
-        targets. Should be less than T_student.
+        targets. Should be less than T_student. For reference, PyLate's
+        Contrastive loss uses 0.03 in production training.
     T_student
         Student temperature. Higher values produce softer predictions.
     top_k
@@ -82,8 +83,8 @@ class SelfDistillation(nn.Module):
         score_metric=colbert_scores,
         size_average: bool = True,
         gather_across_devices: bool = False,
-        T_teacher: float = 1.0,
-        T_student: float = 2.0,
+        T_teacher: float = 0.02,
+        T_student: float = 0.05,
         top_k: int | None = None,
         momentum: float = 0.999,
         center_momentum: float = 0.9,
