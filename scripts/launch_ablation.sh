@@ -7,7 +7,7 @@ GPUS="${GPUS:-8}"
 
 mkdir -p logs
 
-for LOSS in contrastive self-distill self-distill-topk; do
+for LOSS in self-distill self-distill-topk; do
     JOB_NAME="ablation-${LOSS}"
 
     sbatch \
