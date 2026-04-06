@@ -43,8 +43,8 @@ def train_run(
     save_steps: int = 500,
     logging_steps: int = 10,
     document_length: int = 180,
-    T_teacher: float = 0.02,
-    T_student: float = 0.05,
+    T_teacher: float = 1.0,
+    T_student: float = 2.0,
     top_k: int | None = None,
     momentum: float = 0.999,
     contrastive_temperature: float = 0.03,
@@ -62,12 +62,16 @@ def train_run(
     )
 
     # Dataset: MS MARCO triplets (query, positive, negative) — 502,931 samples
+    # Load on main process first to avoid race condition on split caching
     dataset = load_dataset(
         "sentence-transformers/msmarco-bm25", "triplet", split="train"
     )
     splits = dataset.train_test_split(test_size=0.01, seed=42)
     train_dataset = splits["train"]
     eval_dataset = splits["test"]
+    # Force cache write before other processes try to read
+    train_dataset.flatten_indices()
+    eval_dataset.flatten_indices()
 
     # Loss
     if loss_name == "contrastive":
@@ -163,8 +167,8 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-project", type=str, default="ablation-self-distillation")
 
     # SelfDistillation hyperparameters
-    parser.add_argument("--T-teacher", type=float, default=0.02)
-    parser.add_argument("--T-student", type=float, default=0.05)
+    parser.add_argument("--T-teacher", type=float, default=1.0)
+    parser.add_argument("--T-student", type=float, default=2.0)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--momentum", type=float, default=0.999)
 

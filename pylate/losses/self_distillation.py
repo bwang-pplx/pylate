@@ -36,8 +36,12 @@ class SelfDistillation(nn.Module):
         Whether to gather embeddings across devices for more in-batch negatives.
     T_teacher
         Teacher temperature. Lower values produce sharper (more confident)
-        targets. Should be less than T_student. For reference, PyLate's
-        Contrastive loss uses 0.03 in production training.
+        targets. Should be less than T_student. Note: ColBERT scores are
+        sums of per-token max cosine similarities (typical range ~10–25),
+        much larger than single cosine similarities. Temperatures must be
+        high enough (~1.0) that softmax produces non-degenerate distributions.
+        The Contrastive loss uses 0.03, but that works only with hard labels
+        (cross-entropy), not soft targets (KL divergence).
     T_student
         Student temperature. Higher values produce softer predictions.
     top_k
@@ -83,8 +87,8 @@ class SelfDistillation(nn.Module):
         score_metric=colbert_scores,
         size_average: bool = True,
         gather_across_devices: bool = False,
-        T_teacher: float = 0.02,
-        T_student: float = 0.05,
+        T_teacher: float = 1.0,
+        T_student: float = 2.0,
         top_k: int | None = None,
         momentum: float = 0.999,
         center_momentum: float = 0.9,
@@ -181,7 +185,8 @@ class SelfDistillation(nn.Module):
             for sentence_feature in sentence_features
         ]
 
-        # --- Teacher encoding (no gradients) ---
+        # --- Teacher encoding (no gradients, eval mode like DINO) ---
+        self.teacher.eval()
         with torch.no_grad():
             teacher_embeddings = [
                 F.normalize(
