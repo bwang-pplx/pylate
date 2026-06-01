@@ -46,11 +46,25 @@ class SparseDistillation(nn.Module):
 
     Both dense and sparse token embeddings are L2-normalized before the
     similarity is computed, so the dense (cosine) target and the sparse target
-    live on the same scale. Because the sparse codes are non-negative, their
-    cosine similarity lies in ``[0, 1]``; the dense target is clamped to
-    ``[0, 1]`` as well so a non-negative sparse model can drive the loss to zero.
-    The squared error is averaged over valid (non-padding, non-skiplist) token
-    pairs only, making the loss independent of the padding ratio.
+    live on the same scale. Normalization means the sparse codes are trained as
+    *directions* in the sparse space rather than as magnitude-weighted (term
+    weight) vectors. Because the sparse codes are non-negative, their cosine
+    similarity lies in ``[0, 1]``; with ``clamp_dense_target=True`` (default) the
+    dense target is clamped to ``[0, 1]`` as well so a non-negative sparse model
+    can drive the loss to zero -- i.e. it distills the *positive cone* of the
+    dense interactions, which is what MaxSim selects over. Set
+    ``clamp_dense_target=False`` to keep the signed dense target instead (the
+    non-negative sparse codes then cannot represent the negative entries, so the
+    loss has a non-zero floor). The squared error is averaged over valid
+    (non-padding, non-skiplist) token pairs only, making the loss independent of
+    the padding ratio.
+
+    Train/serve consistency: this commits to *cosine* sparse late interaction.
+    PyLate's ``ColBERT.encode`` runs the full module stack (including this sparse
+    projection) and L2-normalizes the final token embeddings when
+    ``normalize_embeddings=True`` (the default), so the codes stored for
+    retrieval are normalized exactly as they are here -- there is no train/serve
+    skew. Retrieval must keep ``normalize_embeddings=True`` for this to hold.
 
     The backbone (every module before the sparse projection) is expected to be
     frozen; by default this loss freezes it for you (``freeze_backbone=True``) so
@@ -135,6 +149,17 @@ class SparseDistillation(nn.Module):
             for parameter in module.parameters():
                 parameter.requires_grad = requires_grad
 
+    def unfreeze_backbone(self) -> None:
+        """Re-enable gradients for every module, undoing :meth:`freeze_backbone`.
+
+        ``freeze_backbone`` mutates the user's model in place; call this to
+        restore the original ``requires_grad`` state (all parameters trainable)
+        if the model is reused outside this loss.
+        """
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        for parameter in model.parameters():
+            parameter.requires_grad = True
+
     def _encode(
         self, features: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -142,18 +167,30 @@ class SparseDistillation(nn.Module):
 
         The dense embeddings are the token embeddings produced by the backbone
         (with gradients disabled) and the sparse codes are the output of the
-        sparse projection applied to them.
+        sparse projection applied to them. The backbone is forced into eval mode
+        for this pass so that dropout/other stochastic layers do not make the
+        distillation targets noisy; its previous train/eval state is restored
+        afterwards. The sparse projection keeps its own train/eval state (its
+        straight-through estimator depends on it).
         """
         model = self.model.module if hasattr(self.model, "module") else self.model
         modules = list(model._modules.values())
         sparse_module = self._module(model, self.sparse_projection_index)
         sparse_position = modules.index(sparse_module)
+        backbone_modules = modules[:sparse_position]
 
-        # Run the frozen backbone without tracking gradients.
-        with torch.no_grad():
-            backbone_features = dict(features)
-            for module in modules[:sparse_position]:
-                backbone_features = module(backbone_features)
+        was_training = [module.training for module in backbone_modules]
+        for module in backbone_modules:
+            module.eval()
+        try:
+            # Run the frozen backbone without tracking gradients.
+            with torch.no_grad():
+                backbone_features = dict(features)
+                for module in backbone_modules:
+                    backbone_features = module(backbone_features)
+        finally:
+            for module, training in zip(backbone_modules, was_training):
+                module.train(training)
         dense_embeddings = backbone_features["token_embeddings"].detach()
 
         sparse_features = sparse_module(dict(backbone_features))
@@ -178,6 +215,11 @@ class SparseDistillation(nn.Module):
         """
         model = self.model.module if hasattr(self.model, "module") else self.model
         sentence_features = list(sentence_features)
+        if len(sentence_features) < 2:
+            raise ValueError(
+                "SparseDistillation requires at least one document in addition to "
+                "the query (sentence_features must have length >= 2)."
+            )
         masks = extract_skiplist_mask(
             sentence_features=sentence_features, skiplist=model.skiplist
         )
@@ -187,8 +229,8 @@ class SparseDistillation(nn.Module):
         query_sparse = torch.nn.functional.normalize(query_sparse, p=2, dim=-1)
         query_mask = masks[0].to(query_dense.dtype)
 
-        squared_error = 0.0
-        valid_pairs = 0.0
+        squared_error = query_dense.new_zeros(())
+        valid_pairs = query_dense.new_zeros(())
         for features, mask in zip(sentence_features[1:], masks[1:]):
             document_dense, document_sparse = self._encode(features)
             document_dense = torch.nn.functional.normalize(document_dense, p=2, dim=-1)
@@ -212,6 +254,9 @@ class SparseDistillation(nn.Module):
 
         if not self.size_average:
             return squared_error
-        if isinstance(valid_pairs, float):
-            return squared_error
-        return squared_error / valid_pairs.clamp_min(1.0)
+        if valid_pairs == 0:
+            raise ValueError(
+                "No valid (non-padding, non-skiplist) query-document token pairs "
+                "to compute the loss over."
+            )
+        return squared_error / valid_pairs

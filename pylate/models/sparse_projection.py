@@ -10,6 +10,16 @@ from torch import nn
 
 __all__ = ["SparseProjection"]
 
+# Non-negative activations keep the sparse codes in the cosine "positive cone"
+# that :class:`~pylate.losses.SparseDistillation` distills into. ``softplus`` is
+# offered as a smooth alternative to ``relu`` that has a non-zero gradient for
+# negative pre-activations (avoiding dead units), at the cost of exact zeros only
+# coming from the TopK mask.
+_ACTIVATIONS = {
+    "relu": nn.ReLU,
+    "softplus": nn.Softplus,
+}
+
 
 class SparseProjection(nn.Module):
     """Sparse projection module that maps dense ColBERT token embeddings to
@@ -37,6 +47,12 @@ class SparseProjection(nn.Module):
         activation is applied (no hard sparsity). Defaults to ``None``.
     bias
         Whether to add a bias vector to the linear layer. Defaults to ``False``.
+    activation
+        Name of the non-negative activation applied before the TopK mask. One of
+        ``"relu"`` (default) or ``"softplus"``. ``relu`` zeroes negative
+        pre-activations (and gives them zero gradient); ``softplus`` is smooth
+        and keeps a non-zero gradient everywhere, which can help avoid dead
+        units, at the cost of relying solely on the TopK mask for hard zeros.
 
     Examples
     --------
@@ -54,8 +70,8 @@ class SparseProjection(nn.Module):
     >>> # Codes are non-negative and at most k entries per token are non-zero.
     >>> bool((features["token_embeddings"] >= 0).all())
     True
-    >>> int((features["token_embeddings"] > 0).sum(dim=-1).max())
-    8
+    >>> bool((features["token_embeddings"] > 0).sum(dim=-1).max() <= 8)
+    True
 
     """
 
@@ -65,17 +81,23 @@ class SparseProjection(nn.Module):
         out_features: int,
         k: int | None = None,
         bias: bool = False,
+        activation: str = "relu",
     ) -> None:
         super().__init__()
         if k is not None and (k <= 0 or k > out_features):
             raise ValueError(
                 f"k must be in the range [1, out_features={out_features}], got {k}."
             )
+        if activation not in _ACTIVATIONS:
+            raise ValueError(
+                f"activation must be one of {sorted(_ACTIVATIONS)}, got {activation!r}."
+            )
         self.in_features = in_features
         self.out_features = out_features
         self.k = k
+        self.activation = activation
         self.linear = nn.Linear(in_features, out_features, bias=bias)
-        self.activation_function = nn.ReLU()
+        self.activation_function = _ACTIVATIONS[activation]()
 
     def topk_mask(self, codes: torch.Tensor) -> torch.Tensor:
         """Keep only the ``k`` largest entries of each token code, zeroing the rest.
@@ -115,6 +137,7 @@ class SparseProjection(nn.Module):
             "out_features": self.out_features,
             "k": self.k,
             "bias": self.linear.bias is not None,
+            "activation": self.activation,
         }
 
     def save(self, output_path: str, *args, safe_serialization: bool = True, **kwargs):

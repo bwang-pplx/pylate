@@ -66,6 +66,25 @@ class TestSparseProjectionSparsity:
         assert torch.allclose(masked, expected)
 
 
+class TestSparseProjectionActivation:
+    def test_softplus_is_strictly_positive(self) -> None:
+        # softplus has no hard zeros (unlike relu), so without TopK every entry
+        # stays positive. This is the "no dead units" property it is offered for.
+        proj = SparseProjection(
+            in_features=8, out_features=16, k=None, activation="softplus"
+        ).eval()
+        out = proj({"token_embeddings": torch.randn(2, 3, 8)})["token_embeddings"]
+        assert bool((out > 0).all())
+
+    def test_invalid_activation_raises(self) -> None:
+        with pytest.raises(ValueError):
+            SparseProjection(in_features=8, out_features=16, activation="gelu")
+
+    def test_activation_persisted_in_config(self) -> None:
+        proj = SparseProjection(in_features=8, out_features=16, activation="softplus")
+        assert proj.get_config_dict()["activation"] == "softplus"
+
+
 class TestSparseProjectionStraightThrough:
     def test_gradients_flow_to_non_topk_logits(self) -> None:
         # With the straight-through estimator, every output dimension's weights
@@ -195,6 +214,90 @@ class TestSparseDistillationMath:
         padded_loss = float(loss_fn(sentence_features=[query, padded]))
         assert abs(base - padded_loss) < 1e-6
 
+    def test_clamp_false_keeps_signed_target(self) -> None:
+        """With clamp_dense_target=False the dense target keeps its sign, so a
+        non-negative sparse model cannot match negative entries and the loss has
+        a non-zero floor even when the projection is the identity.
+        """
+        from pylate import losses
+
+        dim = 6
+        proj = SparseProjection(in_features=dim, out_features=dim, k=None).eval()
+        with torch.no_grad():
+            proj.linear.weight.copy_(torch.eye(dim))
+        model = _SyntheticModel(proj).eval()
+
+        # Signed dense embeddings so the cross similarity has negative entries
+        # that the non-negative (relu) sparse codes cannot reproduce.
+        torch.manual_seed(0)
+        query = _make_features(torch.randn(2, 4, dim))
+        document = _make_features(torch.randn(2, 5, dim))
+
+        clamped = losses.SparseDistillation(
+            model=model, freeze_backbone=False, clamp_dense_target=True
+        )
+        signed = losses.SparseDistillation(
+            model=model, freeze_backbone=False, clamp_dense_target=False
+        )
+        # The signed target cannot be matched, so its loss is strictly larger.
+        assert float(signed(sentence_features=[query, document])) > float(
+            clamped(sentence_features=[query, document])
+        )
+
+    def test_requires_at_least_one_document(self) -> None:
+        from pylate import losses
+
+        dim = 6
+        proj = SparseProjection(in_features=dim, out_features=8, k=None).eval()
+        model = _SyntheticModel(proj).eval()
+        loss_fn = losses.SparseDistillation(model=model, freeze_backbone=False)
+
+        query = _make_features(torch.rand(1, 3, dim))
+        with pytest.raises(ValueError):
+            loss_fn(sentence_features=[query])
+
+    def test_all_padding_raises(self) -> None:
+        from pylate import losses
+
+        dim = 6
+        proj = SparseProjection(in_features=dim, out_features=8, k=None).eval()
+        model = _SyntheticModel(proj).eval()
+        loss_fn = losses.SparseDistillation(model=model, freeze_backbone=False)
+
+        query = _make_features(torch.rand(1, 3, dim))
+        document = {
+            "token_embeddings": torch.rand(1, 4, dim),
+            "input_ids": torch.zeros(1, 4, dtype=torch.long),
+            "attention_mask": torch.zeros(1, 4, dtype=torch.long),
+        }
+        with pytest.raises(ValueError):
+            loss_fn(sentence_features=[query, document])
+
+    def test_loss_decreases_under_sgd(self) -> None:
+        """Smoke test: a few SGD steps on the sparse projection reduce the loss,
+        confirming the objective is actually trainable end-to-end.
+        """
+        from pylate import losses
+
+        torch.manual_seed(0)
+        dim = 6
+        proj = SparseProjection(in_features=dim, out_features=16, k=4).train()
+        model = _SyntheticModel(proj).train()
+        loss_fn = losses.SparseDistillation(model=model, freeze_backbone=False)
+
+        query = _make_features(torch.rand(2, 4, dim))
+        document = _make_features(torch.rand(2, 5, dim))
+
+        optimizer = torch.optim.SGD(proj.parameters(), lr=1.0)
+        initial = float(loss_fn(sentence_features=[query, document]))
+        for _ in range(20):
+            optimizer.zero_grad()
+            loss = loss_fn(sentence_features=[query, document])
+            loss.backward()
+            optimizer.step()
+        final = float(loss_fn(sentence_features=[query, document]))
+        assert final < initial
+
 
 def _build_model_with_sparse_projection():
     """Build a small ColBERT model with an appended sparse projection.
@@ -214,7 +317,74 @@ def _build_model_with_sparse_projection():
     return model
 
 
+class _DropoutBackbone(torch.nn.Module):
+    """Backbone stub with dropout, to verify the teacher pass runs in eval mode."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dropout = torch.nn.Dropout(p=0.9)
+
+    def forward(self, features):
+        features = dict(features)
+        features["token_embeddings"] = self.dropout(features["token_embeddings"])
+        return features
+
+
+class _DropoutModel(torch.nn.Module):
+    def __init__(self, sparse_projection: SparseProjection) -> None:
+        super().__init__()
+        self.backbone = _DropoutBackbone()
+        self.sparse = sparse_projection
+        self.skiplist = []
+
+
+class TestSparseDistillationDeterministicTeacher:
+    def test_backbone_forced_to_eval_in_encode(self) -> None:
+        """The dense teacher must be deterministic: even with the model in train
+        mode and a high-dropout backbone, two encodes of the same input agree
+        because _encode forces the backbone into eval mode.
+        """
+        from pylate import losses
+
+        torch.manual_seed(0)
+        dim = 6
+        proj = SparseProjection(in_features=dim, out_features=8, k=None)
+        model = _DropoutModel(proj).train()
+        loss_fn = losses.SparseDistillation(model=model, freeze_backbone=False)
+
+        features = _make_features(torch.rand(2, 4, dim))
+        dense_a, _ = loss_fn._encode(features)
+        dense_b, _ = loss_fn._encode(features)
+        assert torch.allclose(dense_a, dense_b)
+
+    def test_backbone_train_state_restored(self) -> None:
+        from pylate import losses
+
+        dim = 6
+        proj = SparseProjection(in_features=dim, out_features=8, k=None)
+        model = _DropoutModel(proj).train()
+        loss_fn = losses.SparseDistillation(model=model, freeze_backbone=False)
+
+        loss_fn._encode(_make_features(torch.rand(1, 3, dim)))
+        # The backbone's training flag is restored after the teacher pass.
+        assert model.backbone.training
+
+
 class TestSparseDistillationFreeze:
+    def test_unfreeze_restores_backbone(self) -> None:
+        from pylate import losses
+
+        dim = 6
+        proj = SparseProjection(in_features=dim, out_features=8, k=None)
+        model = _SyntheticModel(proj)
+        # Give the backbone a parameter so freeze/unfreeze is observable.
+        model.backbone = torch.nn.Linear(dim, dim)
+        loss_fn = losses.SparseDistillation(model=model, freeze_backbone=True)
+        assert not any(p.requires_grad for p in model.backbone.parameters())
+
+        loss_fn.unfreeze_backbone()
+        assert all(p.requires_grad for p in model.backbone.parameters())
+
     def test_only_sparse_projection_trainable(self) -> None:
         from pylate import losses
 
