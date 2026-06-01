@@ -82,13 +82,24 @@ class SparseProjection(nn.Module):
 
         Operates on the last dimension and preserves the input shape. When ``k``
         is ``None`` the codes are returned unchanged.
+
+        The forward output is always hard-sparse (exactly the kept entries). When
+        the module is in training mode a straight-through estimator is used so
+        that gradients still flow to the dropped (non-top-k) logits: the backward
+        pass sees the dense pre-mask codes. This avoids the dead-logit problem
+        where entries that are never selected would never receive a gradient.
         """
         if self.k is None:
             return codes
         topk_values, topk_indices = codes.topk(self.k, dim=-1)
         mask = torch.zeros_like(codes)
         mask.scatter_(dim=-1, index=topk_indices, src=torch.ones_like(topk_values))
-        return codes * mask
+        sparse_codes = codes * mask
+        if self.training:
+            # Straight-through: forward is hard-sparse, backward flows to all
+            # logits through ``codes``.
+            return codes + (sparse_codes - codes).detach()
+        return sparse_codes
 
     def forward(self, features: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Projects token embeddings to sparse, non-negative token codes."""

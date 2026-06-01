@@ -11,25 +11,23 @@ from .contrastive import extract_skiplist_mask
 __all__ = ["SparseDistillation"]
 
 
-def _token_similarity(embeddings: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Token-token similarity matrix for a batch of sequences.
+def _cross_similarity(queries: torch.Tensor, documents: torch.Tensor) -> torch.Tensor:
+    """Query-token by document-token similarity matrix.
 
     Parameters
     ----------
-    embeddings
-        Token embeddings of shape ``(batch_size, num_tokens, dim)``.
-    mask
-        Boolean/float mask of shape ``(batch_size, num_tokens)`` zeroing padding
-        and skiplist tokens.
+    queries
+        Query token embeddings of shape ``(batch_size, num_query_tokens, dim)``.
+    documents
+        Document token embeddings of shape ``(batch_size, num_doc_tokens, dim)``.
 
     Returns
     -------
-    Similarity tensor of shape ``(batch_size, num_tokens, num_tokens)`` where
-    contributions from masked tokens are zeroed on both axes.
+    Similarity tensor of shape ``(batch_size, num_query_tokens, num_doc_tokens)``.
+    This is the cross-similarity ColBERT retrieval relies on (MaxSim is taken over
+    it), so distilling it preserves the retrieval-relevant structure.
     """
-    similarity = torch.einsum("bsh,bth->bst", embeddings, embeddings)
-    mask = mask.to(similarity.dtype)
-    return similarity * mask.unsqueeze(2) * mask.unsqueeze(1)
+    return torch.einsum("bqh,bdh->bqd", queries, documents)
 
 
 class SparseDistillation(nn.Module):
@@ -37,11 +35,22 @@ class SparseDistillation(nn.Module):
     ColBERT model (Option B / token-level distillation).
 
     The loss trains an additional :class:`~pylate.models.SparseProjection` module
-    so that the token-token similarity matrices produced by the *sparse* codes
-    approximate those produced by the original *dense* ColBERT token embeddings.
-    It is task-specific: it operates on the query and document token embeddings of
-    real (query, documents) pairs, and requires neither reconstruction, a sparse
-    contrastive loss, nor the full SSR auxiliary loss stack.
+    so that the query-token by document-token similarity matrix produced by the
+    *sparse* codes approximates the one produced by the original *dense* ColBERT
+    token embeddings. This cross similarity is exactly what ColBERT's MaxSim
+    scoring is computed over, so distilling it preserves the retrieval-relevant
+    structure. It is task-specific: it operates on the query and document token
+    embeddings of real (query, documents) pairs, and requires neither
+    reconstruction, a sparse contrastive loss, nor the full SSR auxiliary loss
+    stack.
+
+    Both dense and sparse token embeddings are L2-normalized before the
+    similarity is computed, so the dense (cosine) target and the sparse target
+    live on the same scale. Because the sparse codes are non-negative, their
+    cosine similarity lies in ``[0, 1]``; the dense target is clamped to
+    ``[0, 1]`` as well so a non-negative sparse model can drive the loss to zero.
+    The squared error is averaged over valid (non-padding, non-skiplist) token
+    pairs only, making the loss independent of the padding ratio.
 
     The backbone (every module before the sparse projection) is expected to be
     frozen; by default this loss freezes it for you (``freeze_backbone=True``) so
@@ -61,12 +70,11 @@ class SparseDistillation(nn.Module):
     freeze_backbone
         Whether to freeze every module except the sparse projection so that only
         the sparse projection is trained. Defaults to ``True``.
-    normalize_dense
-        Whether to L2-normalize the dense token embeddings before computing their
-        similarity matrix (matching ColBERT's MaxSim scoring). Defaults to
-        ``True``.
+    clamp_dense_target
+        Whether to clamp the dense cosine target to ``[0, 1]`` so that the
+        non-negative sparse codes can match it. Defaults to ``True``.
     size_average
-        Average the loss over the mini-batch (mean) instead of summing.
+        Average the loss over the valid token pairs (mean) instead of summing.
         Defaults to ``True``.
 
     Examples
@@ -98,14 +106,14 @@ class SparseDistillation(nn.Module):
         model: ColBERT,
         sparse_projection_index: int = -1,
         freeze_backbone: bool = True,
-        normalize_dense: bool = True,
+        clamp_dense_target: bool = True,
         size_average: bool = True,
     ) -> None:
         super().__init__()
         self.model = model
         self.sparse_projection_index = sparse_projection_index
-        self.normalize_dense = normalize_dense
-        self.loss_function = nn.MSELoss(reduction="mean" if size_average else "sum")
+        self.clamp_dense_target = clamp_dense_target
+        self.size_average = size_average
         if freeze_backbone:
             self.freeze_backbone()
 
@@ -169,19 +177,41 @@ class SparseDistillation(nn.Module):
 
         """
         model = self.model.module if hasattr(self.model, "module") else self.model
+        sentence_features = list(sentence_features)
         masks = extract_skiplist_mask(
             sentence_features=sentence_features, skiplist=model.skiplist
         )
 
-        loss = 0.0
-        for features, mask in zip(sentence_features, masks):
-            dense_embeddings, sparse_codes = self._encode(features)
-            if self.normalize_dense:
-                dense_embeddings = torch.nn.functional.normalize(
-                    dense_embeddings, p=2, dim=-1
-                )
-            dense_similarity = _token_similarity(dense_embeddings, mask)
-            sparse_similarity = _token_similarity(sparse_codes, mask)
-            loss = loss + self.loss_function(sparse_similarity, dense_similarity)
+        query_dense, query_sparse = self._encode(sentence_features[0])
+        query_dense = torch.nn.functional.normalize(query_dense, p=2, dim=-1)
+        query_sparse = torch.nn.functional.normalize(query_sparse, p=2, dim=-1)
+        query_mask = masks[0].to(query_dense.dtype)
 
-        return loss / len(sentence_features)
+        squared_error = 0.0
+        valid_pairs = 0.0
+        for features, mask in zip(sentence_features[1:], masks[1:]):
+            document_dense, document_sparse = self._encode(features)
+            document_dense = torch.nn.functional.normalize(document_dense, p=2, dim=-1)
+            document_sparse = torch.nn.functional.normalize(
+                document_sparse, p=2, dim=-1
+            )
+
+            dense_similarity = _cross_similarity(query_dense, document_dense)
+            sparse_similarity = _cross_similarity(query_sparse, document_sparse)
+            if self.clamp_dense_target:
+                dense_similarity = dense_similarity.clamp_min(0.0)
+
+            pair_mask = query_mask.unsqueeze(2) * mask.to(query_dense.dtype).unsqueeze(
+                1
+            )
+            squared_error = (
+                squared_error
+                + ((sparse_similarity - dense_similarity) ** 2 * pair_mask).sum()
+            )
+            valid_pairs = valid_pairs + pair_mask.sum()
+
+        if not self.size_average:
+            return squared_error
+        if isinstance(valid_pairs, float):
+            return squared_error
+        return squared_error / valid_pairs.clamp_min(1.0)
