@@ -31,7 +31,6 @@ from tqdm import tqdm
 
 from pylate import evaluation, models
 
-
 QUERY_LENGTHS = {
     "quora": 32,
     "climate-fever": 64,
@@ -55,6 +54,7 @@ def encode_sparse(
     texts: list[str],
     is_query: bool,
     batch_size: int = 64,
+    stream_chunk: int = 2000,
 ) -> list[torch.Tensor]:
     """Encode a list of texts to per-token sparse codes.
 
@@ -62,15 +62,24 @@ def encode_sparse(
     standard ``model.encode`` pipeline already produces sparse codes — each
     returned tensor has shape ``(num_tokens, sparse_dim)`` with at most ``k``
     non-zero entries per row.
+
+    Encoding is streamed in ``stream_chunk``-sized groups, each moved to CPU and
+    the GPU cache cleared, so large corpora don't accumulate every high-dim
+    sparse tensor on the GPU at once (which OOMs above ~10k docs at 16384-dim).
     """
-    embeddings = model.encode(
-        texts,
-        batch_size=batch_size,
-        is_query=is_query,
-        show_progress_bar=True,
-        convert_to_tensor=True,
-    )
-    return [e.cpu() for e in embeddings]
+    out: list[torch.Tensor] = []
+    for start in range(0, len(texts), stream_chunk):
+        embeddings = model.encode(
+            texts[start : start + stream_chunk],
+            batch_size=batch_size,
+            is_query=is_query,
+            show_progress_bar=True,
+            convert_to_tensor=True,
+        )
+        out.extend(e.cpu() for e in embeddings)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return out
 
 
 def maxsim_retrieve(
@@ -173,6 +182,12 @@ def main() -> None:
         default=256,
         help="Number of documents densified at a time on GPU.",
     )
+    parser.add_argument(
+        "--trust_remote_code",
+        action="store_true",
+        default=False,
+        help="Allow custom modeling code (needed for models like pplx-embed).",
+    )
     args = parser.parse_args()
 
     print(f"\n{'=' * 60}")
@@ -185,6 +200,7 @@ def main() -> None:
         args.checkpoint_dir,
         document_length=args.document_length,
         query_length=query_length,
+        trust_remote_code=args.trust_remote_code,
     )
 
     # --- Load BEIR dataset ---

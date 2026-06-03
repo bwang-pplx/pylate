@@ -16,12 +16,14 @@ Quick smoke test on a small public distillation dataset::
 
     python examples/train/sparse_distillation.py \\
         --model_name lightonai/GTE-ModernColBERT-v1 \\
-        --dataset_name lightonai/ms-marco-en-bge-gemma \\
+        --dataset_name sentence-transformers/msmarco-bm25 --dataset_config triplet \\
         --sparse_dim 16384 --k 32 \\
         --batch_size 8 --stop_at_step 50
 
-Override ``--dataset_name`` to use a richer distillation set you have access to
-(e.g. ``lightonai/nv-embed-supervised-distill-dedup``).
+The dataset must be a *text* triplet set (``query`` / ``positive`` / ``negative*``
+columns); ``sentence-transformers/msmarco-bm25`` has multi-negative configs too
+(e.g. ``--dataset_config triplet-50``). Override ``--dataset_name`` /
+``--dataset_config`` to use a richer triplet set you have access to.
 """
 from __future__ import annotations
 
@@ -32,9 +34,6 @@ from typing import Callable
 
 import torch
 from accelerate.utils import set_seed
-
-set_seed(42)
-
 from datasets import DatasetDict, load_dataset
 from sentence_transformers import (
     SentenceTransformerTrainer,
@@ -46,7 +45,9 @@ from transformers import TrainerCallback
 from pylate import evaluation, models
 from pylate.losses import SparseDistillation
 from pylate.models import SparseProjection
+from pylate.utils import AnisotropyCallback
 
+set_seed(42)
 
 # ---------------------------------------------------------------------------
 # Collator (loss-agnostic; samples a fixed number of negatives per batch)
@@ -111,16 +112,50 @@ class ColBERTCollatorSampleNeg:
 
 
 def load_train_datasets(
-    dataset_name: str = "lightonai/ms-marco-en-bge-gemma",
+    dataset_name: str = "sentence-transformers/msmarco-bm25",
+    config_name: str | None = "triplet",
     splits: list[str] | None = None,
 ) -> DatasetDict:
-    """Load a PyLate-compatible distillation dataset (query / positive / negative_*)."""
+    """Load a triplet-text dataset (query / positive / negative_*).
+
+    ``SparseDistillation`` consumes one document group per text column, so this
+    expects a *text* triplet dataset (each row has ``query`` plus ``positive`` /
+    ``negative*`` strings), not the id-based knowledge-distillation format
+    (``query_id`` / ``document_ids`` / ``scores``). ``config_name`` is the HF
+    dataset config (e.g. ``"triplet"`` for ``sentence-transformers/msmarco-bm25``);
+    pass ``None`` for datasets that have no named configs.
+    """
     train_dataset = DatasetDict()
     if splits is None:
         splits = ["train"]
     for split in splits:
-        train_dataset[split] = load_dataset(dataset_name, split=split)
+        train_dataset[split] = load_dataset(dataset_name, config_name, split=split)
     return train_dataset
+
+
+# ---------------------------------------------------------------------------
+# Combined loss (weighted sum of several losses sharing one model)
+# ---------------------------------------------------------------------------
+
+
+class CombinedLoss(torch.nn.Module):
+    """Weighted sum of losses that share the same model.
+
+    Used to add a structure-preserving auxiliary (distillation or
+    reconstruction) on top of the supervised contrastive ranking loss.
+    """
+
+    def __init__(self, losses: list, weights: list[float]) -> None:
+        super().__init__()
+        self.losses = torch.nn.ModuleList(losses)
+        self.weights = weights
+
+    def forward(self, sentence_features, labels=None):
+        total = None
+        for loss_fn, weight in zip(self.losses, self.weights):
+            value = weight * loss_fn(sentence_features=sentence_features, labels=labels)
+            total = value if total is None else total + value
+        return total
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +174,25 @@ class StopAtStepCallback(TrainerCallback):
             print(f"\n  Reached target step {self.stop_at_step}. Stopping training...")
             control.should_training_stop = True
         return control
+
+
+class ChunkedNanoBEIREvaluator(evaluation.NanoBEIREvaluator):
+    """NanoBEIR evaluator that caps ``corpus_chunk_size`` on its sub-evaluators.
+
+    The dense IR evaluator pads an entire corpus chunk of token-embedding
+    matrices into one tensor. With high-dimensional sparse codes (e.g. 16384)
+    the default chunk size (50000) needs ~90 GB and OOMs. Injecting a small
+    ``corpus_chunk_size`` keeps each padded chunk small; the sparse dimension is
+    contracted away in MaxSim, so the metrics are unchanged.
+    """
+
+    def __init__(self, *args, corpus_chunk_size: int = 256, **kwargs) -> None:
+        self._corpus_chunk_size = corpus_chunk_size
+        super().__init__(*args, **kwargs)
+
+    def _load_dataset(self, dataset_name, **ir_evaluator_kwargs):
+        ir_evaluator_kwargs.setdefault("corpus_chunk_size", self._corpus_chunk_size)
+        return super()._load_dataset(dataset_name, **ir_evaluator_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +238,13 @@ def main() -> None:
         "--activation", type=str, default="relu", choices=["relu", "softplus"]
     )
     parser.add_argument("--bias", action="store_true", default=False)
+    parser.add_argument(
+        "--sparse_init",
+        type=str,
+        default="default",
+        choices=["default", "orthogonal"],
+        help="SparseProjection init. 'orthogonal' gives a spread/selective LSH-style start.",
+    )
 
     # SparseDistillation knobs
     parser.add_argument(
@@ -193,13 +254,116 @@ def main() -> None:
         help="Disable clamping the dense teacher cross-similarities to [0, 1].",
     )
     parser.set_defaults(clamp_dense_target=True)
+    parser.add_argument(
+        "--flops_lambda",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the SPLADE-style FLOPS regularizer that spreads activations "
+            "across dimensions (short posting lists). 0 = pure distillation."
+        ),
+    )
+    parser.add_argument(
+        "--flops_warmup_steps",
+        type=int,
+        default=0,
+        help="Quadratically ramp flops_lambda over this many steps (0 = no warmup).",
+    )
+    parser.add_argument(
+        "--flops_on_normalized",
+        dest="flops_on_raw",
+        action="store_false",
+        help="Compute FLOPS on L2-normalized codes instead of raw (weaker signal).",
+    )
+    parser.set_defaults(flops_on_raw=True)
+    parser.add_argument(
+        "--center_dense",
+        action="store_true",
+        default=False,
+        help=(
+            "Subtract the batch mean of dense token embeddings from the teacher "
+            "before building the target (removes the anisotropic common component)."
+        ),
+    )
+    parser.add_argument(
+        "--distillation_mode",
+        type=str,
+        default="token",
+        choices=["token", "score"],
+        help=(
+            "'token': MSE over the full token-token similarity matrix. 'score': "
+            "KL over per-document MaxSim scores (ranking-aware, like ColBERT KD)."
+        ),
+    )
+    parser.add_argument(
+        "--objective",
+        type=str,
+        default="distillation",
+        choices=["distillation", "reconstruction", "contrastive"],
+        help=(
+            "'distillation': match the dense teacher's token similarities. "
+            "'reconstruction': self-supervised sparse autoencoder. "
+            "'contrastive': supervised contrastive on the sparse codes "
+            "(positive vs negatives) -- trains only the sparse head (backbone "
+            "frozen), the cheap label-supervised option."
+        ),
+    )
+    parser.add_argument(
+        "--contrastive_temperature",
+        type=float,
+        default=0.05,
+        help="Temperature for the contrastive objective (lower = sharper).",
+    )
+    parser.add_argument(
+        "--aux_objective",
+        type=str,
+        default="none",
+        choices=["none", "distillation", "reconstruction"],
+        help=(
+            "Auxiliary structure-preserving loss added to 'contrastive': "
+            "'distillation' (match dense token similarities, with --center_dense) "
+            "or 'reconstruction' (sparse autoencoder, with --ortho_lambda)."
+        ),
+    )
+    parser.add_argument(
+        "--aux_lambda",
+        type=float,
+        default=0.0,
+        help="Weight of the auxiliary loss added to the contrastive objective.",
+    )
+    parser.add_argument(
+        "--reconstruct_raw",
+        dest="reconstruct_normalized",
+        action="store_false",
+        help="Reconstruct raw (not L2-normalized) dense embeddings.",
+    )
+    parser.set_defaults(reconstruct_normalized=True)
+    parser.add_argument(
+        "--ortho_lambda",
+        type=float,
+        default=0.0,
+        help=(
+            "Reconstruction: weight of the ||WtW - I|| orthogonality regularizer "
+            "that keeps the projection similarity-preserving (stops the peak-then-"
+            "drop drift)."
+        ),
+    )
 
     # Dataset
     parser.add_argument(
         "--dataset_name",
         type=str,
-        default="lightonai/ms-marco-en-bge-gemma",
-        help="HuggingFace dataset id with query/positive/negative_* columns.",
+        default="sentence-transformers/msmarco-bm25",
+        help="HuggingFace dataset id with query/positive/negative_* text columns.",
+    )
+    parser.add_argument(
+        "--dataset_config",
+        type=str,
+        default="triplet",
+        help=(
+            "HuggingFace dataset config name (e.g. 'triplet'). Pass 'none' for "
+            "datasets without named configs."
+        ),
     )
     parser.add_argument("--dataset_splits", type=str, nargs="+", default=["train"])
 
@@ -215,6 +379,38 @@ def main() -> None:
     parser.add_argument("--no_bf16", dest="bf16", action="store_false")
 
     # Eval / logging / saving
+    parser.add_argument(
+        "--no_eval",
+        dest="eval_during_training",
+        action="store_false",
+        help="Disable the in-loop NanoBEIR evaluator (enabled by default).",
+    )
+    parser.set_defaults(eval_during_training=True)
+    parser.add_argument(
+        "--no_eval_on_start",
+        dest="eval_on_start",
+        action="store_false",
+        help="Skip the step-0 baseline evaluation (run by default).",
+    )
+    parser.set_defaults(eval_on_start=True)
+    parser.add_argument(
+        "--eval_corpus_chunk_size",
+        type=int,
+        default=256,
+        help=(
+            "Number of corpus docs padded/scored at once during NanoBEIR eval. "
+            "The dense evaluator pads a whole chunk of token-embedding matrices "
+            "into one tensor; a small value keeps the high-dimensional sparse "
+            "corpus tensor (e.g. 16384-dim) from OOMing. The 16384 dim is "
+            "contracted in MaxSim, so this does not change the metrics."
+        ),
+    )
+    parser.add_argument(
+        "--track_anisotropy",
+        action="store_true",
+        default=False,
+        help="Log token-level anisotropy (mean_norm/eff_rank/mean_pair_cos) every logging_steps.",
+    )
     parser.add_argument("--eval_steps", type=int, default=1000)
     parser.add_argument("--save_steps", type=int, default=1000)
     parser.add_argument("--logging_steps", type=int, default=10)
@@ -231,9 +427,15 @@ def main() -> None:
     args = parser.parse_args()
 
     # --- Load datasets ---
-    print(f"Loading dataset: {args.dataset_name} (splits={args.dataset_splits})")
+    dataset_config = None if args.dataset_config.lower() == "none" else args.dataset_config
+    print(
+        f"Loading dataset: {args.dataset_name} "
+        f"(config={dataset_config}, splits={args.dataset_splits})"
+    )
     train_dataset = load_train_datasets(
-        dataset_name=args.dataset_name, splits=args.dataset_splits
+        dataset_name=args.dataset_name,
+        config_name=dataset_config,
+        splits=args.dataset_splits,
     )
     print(train_dataset)
 
@@ -252,6 +454,7 @@ def main() -> None:
         k=k,
         bias=args.bias,
         activation=args.activation,
+        init=args.sparse_init,
     )
     colbert.append(sparse)
     print(
@@ -263,20 +466,81 @@ def main() -> None:
     # freeze_backbone=True flips requires_grad so only the sparse projection is
     # trainable; the standard AdamW optimizer below then only updates those
     # parameters.
-    loss = SparseDistillation(
-        model=colbert,
-        sparse_projection_index=-1,
-        freeze_backbone=args.freeze_backbone,
-        clamp_dense_target=args.clamp_dense_target,
-    )
+    if args.objective == "reconstruction":
+        from pylate.losses import SparseReconstruction
+
+        loss = SparseReconstruction(
+            model=colbert,
+            sparse_projection_index=-1,
+            freeze_backbone=args.freeze_backbone,
+            normalize_target=args.reconstruct_normalized,
+            ortho_lambda=args.ortho_lambda,
+        )
+    elif args.objective == "contrastive":
+        from pylate.losses import Contrastive
+
+        # Contrastive does not freeze anything; freeze the backbone here so only
+        # the sparse head trains (label-supervised, backbone fixed).
+        if args.freeze_backbone:
+            sparse_module = colbert[-1]
+            for module in colbert._modules.values():
+                trainable = module is sparse_module
+                for parameter in module.parameters():
+                    parameter.requires_grad = trainable
+        contrastive = Contrastive(
+            model=colbert,
+            temperature=args.contrastive_temperature,
+            gather_across_devices=True,
+        )
+        if args.aux_objective == "none":
+            loss = contrastive
+        elif args.aux_objective == "distillation":
+            aux = SparseDistillation(
+                model=colbert,
+                freeze_backbone=False,  # backbone already frozen above
+                clamp_dense_target=args.clamp_dense_target,
+                center_dense=args.center_dense,
+                distillation_mode=args.distillation_mode,
+                flops_lambda=args.flops_lambda,
+                flops_warmup_steps=args.flops_warmup_steps,
+            )
+            loss = CombinedLoss([contrastive, aux], [1.0, args.aux_lambda])
+        else:  # reconstruction
+            from pylate.losses import SparseReconstruction
+
+            aux = SparseReconstruction(
+                model=colbert,
+                freeze_backbone=False,
+                normalize_target=args.reconstruct_normalized,
+                ortho_lambda=args.ortho_lambda,
+            )
+            loss = CombinedLoss([contrastive, aux], [1.0, args.aux_lambda])
+    else:
+        loss = SparseDistillation(
+            model=colbert,
+            sparse_projection_index=-1,
+            freeze_backbone=args.freeze_backbone,
+            clamp_dense_target=args.clamp_dense_target,
+            flops_lambda=args.flops_lambda,
+            flops_warmup_steps=args.flops_warmup_steps,
+            flops_on_raw=args.flops_on_raw,
+            center_dense=args.center_dense,
+            distillation_mode=args.distillation_mode,
+        )
 
     n_trainable = sum(p.numel() for p in colbert.parameters() if p.requires_grad)
     print(f"Trainable parameters: {n_trainable:,}")
 
     # --- Evaluator ---
-    # Standard NanoBEIR uses cosine MaxSim, matching SparseDistillation's
-    # training target (queries/docs are L2-normalised inside the loss).
-    dev_evaluator = evaluation.NanoBEIREvaluator()
+    # NanoBEIR with a small corpus_chunk_size so the high-dimensional sparse
+    # corpus tensor does not OOM (see ChunkedNanoBEIREvaluator). Evaluated at
+    # step 0 (baseline) and every eval_steps. For a full-scale, index-based
+    # sparse eval use examples/evaluation/sparse_distillation_beir.py.
+    dev_evaluator = (
+        ChunkedNanoBEIREvaluator(corpus_chunk_size=args.eval_corpus_chunk_size)
+        if args.eval_during_training
+        else None
+    )
 
     # --- Run name / output dir ---
     model_shortname = args.model_name.split("/")[-1]
@@ -310,8 +574,9 @@ def main() -> None:
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         multi_dataset_batch_sampler=MultiDatasetBatchSamplers.PROPORTIONAL,
-        eval_strategy="steps",
+        eval_strategy="steps" if dev_evaluator is not None else "no",
         eval_steps=args.eval_steps,
+        eval_on_start=args.eval_on_start if dev_evaluator is not None else False,
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
         fp16=False,
@@ -336,6 +601,13 @@ def main() -> None:
     callbacks: list[TrainerCallback] = []
     if args.stop_at_step > 0:
         callbacks.append(StopAtStepCallback(args.stop_at_step))
+    if args.track_anisotropy:
+        probe = list(train_dataset[args.dataset_splits[0]]["positive"][:256])
+        callbacks.append(
+            AnisotropyCallback(
+                colbert, probe_texts=probe, every_n_steps=args.logging_steps
+            )
+        )
 
     # --- Trainer ---
     # SparseDistillation already set requires_grad correctly, so the default
