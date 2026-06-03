@@ -25,6 +25,7 @@ from ..hf_hub.model_card import PylateModelCardData
 from ..scores import SimilarityFunction
 from ..utils import _start_multi_process_pool
 from .Dense import Dense
+from .sparse_projection import SparseProjection
 
 logger = logging.getLogger(__name__)
 
@@ -333,9 +334,13 @@ class ColBERT(SentenceTransformer):
                     )
                 )
                 logger.info("Created a PyLate model from base encoder.")
-        # Convert ST dense layers to PyLate dense layers
+        # Convert ST dense layers to PyLate dense layers. Only genuine
+        # SentenceTransformer Dense layers are converted; other appended modules
+        # (e.g. SparseProjection) are left untouched.
         for i in range(1, len(self)):
-            if not isinstance(self[i], Dense):
+            if isinstance(self[i], DenseSentenceTransformer) and not isinstance(
+                self[i], Dense
+            ):
                 self[i] = Dense.from_sentence_transformers(dense=self[i])
         # If the user defined an output dimension and the last linear dimension is not the same, add a dense layer
         if embedding_size is not None and self[-1].out_features != embedding_size:
@@ -1342,6 +1347,7 @@ class ColBERT(SentenceTransformer):
             for module in modules.values()
             if isinstance(module, Transformer)
             or isinstance(module, DenseSentenceTransformer)
+            or isinstance(module, SparseProjection)
         ], module_kwargs
 
     def _get_model_type(

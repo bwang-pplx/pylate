@@ -166,3 +166,6 @@ uv.lock
 indexes/*
 pylate-index/*
 /docs/api/
+
+# slurm logs
+logs/
