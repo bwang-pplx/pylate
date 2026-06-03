@@ -427,3 +427,37 @@ class TestSparseDistillationLoss:
         assert sparse.linear.weight.grad is not None
         backbone = list(model._modules.values())[0]
         assert next(backbone.parameters()).grad is None
+
+
+class TestSparseProjectionModelRoundtrip:
+    def test_save_pretrained_reload_keeps_sparse_projection(self, tmp_path) -> None:
+        """A ColBERT model with an appended SparseProjection must round-trip
+        through ``save_pretrained`` / ``models.ColBERT(path)``.
+
+        This guards the train -> save -> reload -> encode workflow the example
+        scripts rely on: the ColBERT loader used to keep only Transformer/Dense
+        modules, silently dropping the sparse head so ``encode`` returned dense
+        embeddings after reload.
+        """
+        from pylate import models
+
+        model = _build_model_with_sparse_projection()
+        k = model[-1].k
+        before = model.encode(
+            ["fruits are healthy."], is_query=False, convert_to_tensor=True
+        )[0]
+
+        model.save_pretrained(str(tmp_path))
+        reloaded = models.ColBERT(str(tmp_path), device="cpu")
+
+        assert isinstance(reloaded[-1], SparseProjection)
+        assert reloaded[-1].k == k
+
+        after = reloaded.encode(
+            ["fruits are healthy."], is_query=False, convert_to_tensor=True
+        )[0]
+        # Sparse codes survive the reload: same shape, same TopK sparsity, and
+        # numerically identical to the pre-save encoding.
+        assert after.shape == before.shape
+        assert int((after > 0).sum(dim=-1).max()) <= k
+        assert torch.allclose(before, after, atol=1e-5)

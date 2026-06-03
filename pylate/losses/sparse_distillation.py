@@ -30,6 +30,22 @@ def _cross_similarity(queries: torch.Tensor, documents: torch.Tensor) -> torch.T
     return torch.einsum("bqh,bdh->bqd", queries, documents)
 
 
+def _masked_maxsim(
+    similarity: torch.Tensor, query_mask: torch.Tensor, document_mask: torch.Tensor
+) -> torch.Tensor:
+    """ColBERT MaxSim score per (query, document) pair from a cross-similarity.
+
+    ``similarity`` is ``(batch, num_query_tokens, num_doc_tokens)``. Invalid
+    document tokens are masked out before the max over document tokens, and
+    invalid query tokens are zeroed before the sum, giving a ``(batch,)`` score.
+    """
+    neg_inf = torch.finfo(similarity.dtype).min
+    masked = similarity.masked_fill(document_mask.unsqueeze(1) == 0, neg_inf)
+    per_query_token_max = masked.max(dim=2).values
+    per_query_token_max = per_query_token_max * query_mask
+    return per_query_token_max.sum(dim=1)
+
+
 class SparseDistillation(nn.Module):
     """Token-level distillation loss for learning a sparse projection on top of a
     ColBERT model (Option B / token-level distillation).
@@ -90,6 +106,44 @@ class SparseDistillation(nn.Module):
     size_average
         Average the loss over the valid token pairs (mean) instead of summing.
         Defaults to ``True``.
+    flops_lambda
+        Weight of the FLOPS regularizer (SPLADE-style). The FLOPS term is
+        ``sum_j (mean_token activation_j)^2`` computed separately over the valid
+        query tokens and document tokens and summed. Because it penalizes the
+        *square* of each dimension's average activation, it punishes dimensions
+        that fire across many tokens/documents, pushing activations to spread
+        across many dimensions with short posting lists (a cheap inverted index).
+        ``0.0`` (default) disables it and the loss is the pure distillation MSE.
+    flops_warmup_steps
+        If ``> 0``, ramp the FLOPS weight quadratically from ``0`` to
+        ``flops_lambda`` over this many ``forward`` calls (SPLADE warmup), so the
+        model learns the distillation task before being squeezed sparse. ``0``
+        (default) applies ``flops_lambda`` from the first step.
+    flops_on_raw
+        Whether to compute the FLOPS term on the *raw* sparse codes (before L2
+        normalization) rather than the normalized ones. Defaults to ``True``,
+        matching SPLADE: normalizing caps every token's mass at unit norm, which
+        blunts the FLOPS penalty (concentrating mass becomes "free" under a fixed
+        norm budget). The raw activations give the regularizer a much sharper
+        signal. The distillation MSE always uses the normalized codes regardless.
+    center_dense
+        Whether to subtract the batch mean of the valid dense token embeddings
+        from the dense teacher before building the target similarity. Defaults to
+        ``False``. Contextualized token embeddings are anisotropic (a large shared
+        component), so the uncentered similarity matrix is dominated by a
+        near-constant positive offset -- cheap to reproduce by collapsing onto a
+        few shared sparse dimensions, while the discriminative residual that
+        drives ranking is under-fit. Centering removes that common component so
+        the target reflects discriminative structure. Only the *target* is
+        centered; the sparse codes (and retrieval) are unchanged.
+    distillation_mode
+        ``"token"`` (default) minimizes the MSE over the full query-token ×
+        document-token similarity matrix. ``"score"`` instead reduces each
+        (query, document) pair to its ColBERT **MaxSim score** and distills those
+        with a KL divergence over the candidate documents (positive + negatives),
+        like standard ColBERT knowledge distillation. ``"score"`` optimizes the
+        ranking signal directly rather than every token pair (most of which are
+        irrelevant to MaxSim), and requires at least two documents per query.
 
     Examples
     --------
@@ -122,12 +176,33 @@ class SparseDistillation(nn.Module):
         freeze_backbone: bool = True,
         clamp_dense_target: bool = True,
         size_average: bool = True,
+        flops_lambda: float = 0.0,
+        flops_warmup_steps: int = 0,
+        flops_on_raw: bool = True,
+        center_dense: bool = False,
+        distillation_mode: str = "token",
     ) -> None:
         super().__init__()
+        if distillation_mode not in ("token", "score"):
+            raise ValueError(
+                f"distillation_mode must be 'token' or 'score', got "
+                f"{distillation_mode!r}."
+            )
         self.model = model
         self.sparse_projection_index = sparse_projection_index
         self.clamp_dense_target = clamp_dense_target
         self.size_average = size_average
+        self.flops_lambda = flops_lambda
+        self.flops_warmup_steps = flops_warmup_steps
+        self.flops_on_raw = flops_on_raw
+        self.center_dense = center_dense
+        self.distillation_mode = distillation_mode
+        # Forward-call counter for the (optional) quadratic FLOPS warmup. Plain
+        # int (not a buffer): only used for lambda scheduling, not checkpointed.
+        self._step = 0
+        # Most recent loss components, for logging/inspection.
+        self.last_distillation = 0.0
+        self.last_flops = 0.0
         if freeze_backbone:
             self.freeze_backbone()
 
@@ -224,18 +299,56 @@ class SparseDistillation(nn.Module):
             sentence_features=sentence_features, skiplist=model.skiplist
         )
 
-        query_dense, query_sparse = self._encode(sentence_features[0])
-        query_dense = torch.nn.functional.normalize(query_dense, p=2, dim=-1)
-        query_sparse = torch.nn.functional.normalize(query_sparse, p=2, dim=-1)
-        query_mask = masks[0].to(query_dense.dtype)
+        # Encode every group up front: centering needs the batch mean over all
+        # valid dense tokens before any similarity is formed. Stores raw dense
+        # and raw sparse codes plus the float mask per group.
+        encoded = []
+        for features, mask in zip(sentence_features, masks):
+            dense, sparse_raw = self._encode(features)
+            encoded.append((dense, sparse_raw, mask.to(dense.dtype)))
+
+        # Mean of the valid (non-padding, non-skiplist) dense token embeddings,
+        # pooled across query and documents. Subtracted from the dense teacher to
+        # remove the anisotropic common component before building the target.
+        dense_mean = None
+        if self.center_dense:
+            activation_sum = encoded[0][0].new_zeros(encoded[0][0].shape[-1])
+            token_count = encoded[0][0].new_zeros(())
+            for dense, _, mask in encoded:
+                activation_sum = activation_sum + (dense * mask.unsqueeze(-1)).sum(
+                    dim=(0, 1)
+                )
+                token_count = token_count + mask.sum()
+            dense_mean = activation_sum / token_count.clamp_min(1.0)
+
+        def prepare(dense, sparse_raw):
+            if dense_mean is not None:
+                dense = dense - dense_mean
+            dense_n = torch.nn.functional.normalize(dense, p=2, dim=-1)
+            sparse_n = torch.nn.functional.normalize(sparse_raw, p=2, dim=-1)
+            flops_codes = sparse_raw if self.flops_on_raw else sparse_n
+            return dense_n, sparse_n, flops_codes
+
+        query_dense, query_sparse, query_flops_codes = prepare(*encoded[0][:2])
+        query_mask = encoded[0][2]
 
         squared_error = query_dense.new_zeros(())
         valid_pairs = query_dense.new_zeros(())
-        for features, mask in zip(sentence_features[1:], masks[1:]):
-            document_dense, document_sparse = self._encode(features)
-            document_dense = torch.nn.functional.normalize(document_dense, p=2, dim=-1)
-            document_sparse = torch.nn.functional.normalize(
-                document_sparse, p=2, dim=-1
+        # Per-document MaxSim scores (score mode only).
+        dense_scores: list[torch.Tensor] = []
+        sparse_scores: list[torch.Tensor] = []
+
+        # FLOPS regularizer accumulators (document side). Summed activations per
+        # dimension over valid document tokens, plus the valid-token count, so we
+        # can form the per-dimension mean once at the end.
+        compute_flops = self.flops_lambda > 0
+        if compute_flops:
+            doc_activation_sum = query_sparse.new_zeros(query_sparse.shape[-1])
+            doc_token_count = query_sparse.new_zeros(())
+
+        for document_dense_raw, document_sparse_raw, mask in encoded[1:]:
+            document_dense, document_sparse, document_flops_codes = prepare(
+                document_dense_raw, document_sparse_raw
             )
 
             dense_similarity = _cross_similarity(query_dense, document_dense)
@@ -243,20 +356,77 @@ class SparseDistillation(nn.Module):
             if self.clamp_dense_target:
                 dense_similarity = dense_similarity.clamp_min(0.0)
 
-            pair_mask = query_mask.unsqueeze(2) * mask.to(query_dense.dtype).unsqueeze(
-                1
-            )
-            squared_error = (
-                squared_error
-                + ((sparse_similarity - dense_similarity) ** 2 * pair_mask).sum()
-            )
-            valid_pairs = valid_pairs + pair_mask.sum()
+            if self.distillation_mode == "score":
+                dense_scores.append(
+                    _masked_maxsim(dense_similarity, query_mask, mask)
+                )
+                sparse_scores.append(
+                    _masked_maxsim(sparse_similarity, query_mask, mask)
+                )
+            else:
+                pair_mask = query_mask.unsqueeze(2) * mask.unsqueeze(1)
+                squared_error = (
+                    squared_error
+                    + ((sparse_similarity - dense_similarity) ** 2 * pair_mask).sum()
+                )
+                valid_pairs = valid_pairs + pair_mask.sum()
 
-        if not self.size_average:
-            return squared_error
-        if valid_pairs == 0:
-            raise ValueError(
-                "No valid (non-padding, non-skiplist) query-document token pairs "
-                "to compute the loss over."
+            if compute_flops:
+                document_mask = mask.unsqueeze(-1)
+                doc_activation_sum = doc_activation_sum + (
+                    document_flops_codes * document_mask
+                ).sum(dim=(0, 1))
+                doc_token_count = doc_token_count + document_mask.sum()
+
+        if self.distillation_mode == "score":
+            if len(dense_scores) < 2:
+                raise ValueError(
+                    "distillation_mode='score' needs at least two documents per "
+                    "query (positive + negative) to distill a ranking."
+                )
+            # (batch, num_documents) scores; KL of the candidate distributions.
+            dense_score_matrix = torch.stack(dense_scores, dim=1)
+            sparse_score_matrix = torch.stack(sparse_scores, dim=1)
+            target = torch.nn.functional.log_softmax(dense_score_matrix, dim=-1)
+            student = torch.nn.functional.log_softmax(sparse_score_matrix, dim=-1)
+            distillation = torch.nn.functional.kl_div(
+                student,
+                target,
+                reduction="batchmean" if self.size_average else "sum",
+                log_target=True,
             )
-        return squared_error / valid_pairs
+        elif self.size_average:
+            if valid_pairs == 0:
+                raise ValueError(
+                    "No valid (non-padding, non-skiplist) query-document token "
+                    "pairs to compute the loss over."
+                )
+            distillation = squared_error / valid_pairs
+        else:
+            distillation = squared_error
+
+        self.last_distillation = float(distillation.detach())
+        if not compute_flops:
+            return distillation
+
+        # FLOPS = sum_j (mean_token activation_j)^2, query and document sides
+        # summed. Penalizing the square of each dimension's mean activation
+        # discourages dimensions shared across many tokens -> short posting lists.
+        query_activation_sum = (query_flops_codes * query_mask.unsqueeze(-1)).sum(
+            dim=(0, 1)
+        )
+        query_token_count = query_mask.sum().clamp_min(1.0)
+        flops_query = (query_activation_sum / query_token_count).pow(2).sum()
+        flops_document = (doc_activation_sum / doc_token_count.clamp_min(1.0)).pow(2).sum()
+        flops = flops_query + flops_document
+
+        if self.training:
+            self._step += 1
+        if self.flops_warmup_steps > 0:
+            scale = min(1.0, (self._step / self.flops_warmup_steps) ** 2)
+        else:
+            scale = 1.0
+        effective_lambda = self.flops_lambda * scale
+
+        self.last_flops = float(flops.detach())
+        return distillation + effective_lambda * flops

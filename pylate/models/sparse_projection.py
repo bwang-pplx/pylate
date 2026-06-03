@@ -82,6 +82,7 @@ class SparseProjection(nn.Module):
         k: int | None = None,
         bias: bool = False,
         activation: str = "relu",
+        init: str = "default",
     ) -> None:
         super().__init__()
         if k is not None and (k <= 0 or k > out_features):
@@ -92,12 +93,24 @@ class SparseProjection(nn.Module):
             raise ValueError(
                 f"activation must be one of {sorted(_ACTIVATIONS)}, got {activation!r}."
             )
+        if init not in ("default", "orthogonal"):
+            raise ValueError(
+                f"init must be 'default' or 'orthogonal', got {init!r}."
+            )
         self.in_features = in_features
         self.out_features = out_features
         self.k = k
         self.activation = activation
         self.linear = nn.Linear(in_features, out_features, bias=bias)
         self.activation_function = _ACTIVATIONS[activation]()
+        # "orthogonal" gives the projection's output dimensions maximally diverse
+        # directions (semi-orthogonal rows), which spreads activations across more
+        # dimensions -- an LSH/random-projection-style spread sparse code, useful
+        # as a de-collapsed untrained baseline.
+        if init == "orthogonal":
+            nn.init.orthogonal_(self.linear.weight)
+            if self.linear.bias is not None:
+                nn.init.zeros_(self.linear.bias)
 
     def topk_mask(self, codes: torch.Tensor) -> torch.Tensor:
         """Keep only the ``k`` largest entries of each token code, zeroing the rest.

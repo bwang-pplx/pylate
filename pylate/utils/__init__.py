@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .anisotropy import AnisotropyCallback, token_anisotropy
 from .collator import ColBERTCollator
 from .distributed import all_gather, all_gather_with_gradients, get_rank, get_world_size
 from .huggingface_models import HUGGINGFACE_MODELS
@@ -19,4 +20,6 @@ __all__ = [
     "all_gather_with_gradients",
     "get_rank",
     "get_world_size",
+    "token_anisotropy",
+    "AnisotropyCallback",
 ]
